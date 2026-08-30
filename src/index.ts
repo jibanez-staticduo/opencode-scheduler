@@ -13,7 +13,7 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
+import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
@@ -1155,6 +1155,68 @@ function uninstallLaunchdJob(job: Job): void {
 
 // === SYSTEMD (Linux) ===
 
+// Build the environment used for every `systemctl --user ...` /
+// `systemd-analyze` call.
+//
+// The parent opencode process is often launched without `XDG_RUNTIME_DIR`
+// (e.g. via an SSH/systemd service context that does not populate it), which
+// makes `systemctl --user` fail with "Failed to connect to bus" even though a
+// real user manager socket exists. Derive it from the current uid's runtime
+// directory when present, and derive `DBUS_SESSION_BUS_ADDRESS` from it so the
+// user bus is reachable.
+function withSystemdRuntimeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const next: NodeJS.ProcessEnv = { ...env }
+
+  if (!next.XDG_RUNTIME_DIR) {
+    const uid = process.getuid?.()
+    if (typeof uid === "number") {
+      const runtimeDir = `/run/user/${uid}`
+      if (existsSync(runtimeDir)) {
+        next.XDG_RUNTIME_DIR = runtimeDir
+      }
+    }
+  }
+
+  if (!next.DBUS_SESSION_BUS_ADDRESS && next.XDG_RUNTIME_DIR) {
+    const busPath = join(next.XDG_RUNTIME_DIR, "bus")
+    if (existsSync(busPath)) {
+      next.DBUS_SESSION_BUS_ADDRESS = `unix:path=${busPath}`
+    }
+  }
+
+  return next
+}
+
+function systemdRunEnv(): NodeJS.ProcessEnv {
+  const enhancedPath = getEnhancedPath()
+  const existingPath = process.env.PATH
+  return withSystemdRuntimeEnv({
+    ...process.env,
+    PATH: existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath,
+  })
+}
+
+type SystemdCommandRunner = (
+  command: string,
+  options?: Parameters<typeof execSync>[1]
+) => ReturnType<typeof execSync>
+
+function defaultSystemdCommandRunner(
+  command: string,
+  options?: Parameters<typeof execSync>[1]
+): ReturnType<typeof execSync> {
+  return execSync(command, { ...options, env: systemdRunEnv() })
+}
+
+// Indirection kept as a unit-test seam so tests can stub systemctl without
+// shadowing the real binary (getEnhancedPath() always resolves /usr/bin
+// first). Production code never replaces it.
+let systemdCommandRunner: SystemdCommandRunner = defaultSystemdCommandRunner
+
+function systemdExecSync(command: string, options?: Parameters<typeof execSync>[1]): ReturnType<typeof execSync> {
+  return systemdCommandRunner(command, options)
+}
+
 function createSystemdService(job: Job): string {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
   const logFilePath = scopedLogPath(scopeId, job.slug)
@@ -1233,8 +1295,8 @@ function uninstallSystemdJob(job: Job): void {
 
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
     try {
-      execSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" })
-      execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
+      systemdExecSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" })
+      systemdExecSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
     } catch {}
   }
 
@@ -1252,7 +1314,7 @@ function uninstallSystemdJob(job: Job): void {
   }
 
   try {
-    execSync("systemctl --user daemon-reload", { stdio: "ignore" })
+    systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" })
   } catch {}
 }
 
@@ -1306,9 +1368,8 @@ function isSystemdUserAvailable(): boolean {
   if (!IS_LINUX) return false
   if (!isCommandAvailable("systemctl")) return false
   try {
-    execSync("systemctl --user show-environment", {
+    systemdExecSync("systemctl --user show-environment", {
       stdio: "ignore",
-      env: buildRunEnvironment(),
     })
     return true
   } catch {
