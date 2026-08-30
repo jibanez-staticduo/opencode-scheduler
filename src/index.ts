@@ -3402,20 +3402,26 @@ export default SchedulerPlugin
 
 // Exported for the repo's unit tests (bun test). This is not part of the
 // plugin's public API; do not rely on it from consumer code.
-export type { SystemdCommandRunner }
-export const __test__ = {
-  cronToSystemdCalendars,
-  createSystemdTimer,
-  withSystemdRuntimeEnv,
-  systemdRunEnv,
-  installSystemdJob,
-  uninstallSystemdJob,
-  saveJob,
-  deleteJobFile,
-  jobFilePath,
-  SYSTEMD_USER_DIR,
-  SCOPES_DIR,
-  setSystemdCommandRunner(runner: SystemdCommandRunner | null): void {
-    systemdCommandRunner = runner ?? defaultSystemdCommandRunner
+//
+// IMPORTANT: opencode's plugin loader treats EVERY module export as a plugin
+// factory and rejects non-function exports ("Plugin export is not a
+// function"), so test internals are attached as a property on the plugin
+// function instead of being exported as a separate binding.
+Object.assign(SchedulerPlugin, {
+  __test__: {
+    cronToSystemdCalendars,
+    createSystemdTimer,
+    withSystemdRuntimeEnv,
+    systemdRunEnv,
+    installSystemdJob,
+    uninstallSystemdJob,
+    saveJob,
+    deleteJobFile,
+    jobFilePath,
+    SYSTEMD_USER_DIR,
+    SCOPES_DIR,
+    setSystemdCommandRunner(runner: SystemdCommandRunner | null): void {
+      systemdCommandRunner = runner ?? defaultSystemdCommandRunner
+    },
   },
-}
+})
