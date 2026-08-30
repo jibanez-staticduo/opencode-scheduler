@@ -15019,24 +15019,25 @@ ${logs}`, { job, logPath, logs });
   };
 };
 var src_default = SchedulerPlugin;
-var __test__ = {
-  cronToSystemdCalendars,
-  createSystemdTimer,
-  withSystemdRuntimeEnv,
-  systemdRunEnv,
-  installSystemdJob,
-  uninstallSystemdJob,
-  saveJob,
-  deleteJobFile,
-  jobFilePath,
-  SYSTEMD_USER_DIR,
-  SCOPES_DIR,
-  setSystemdCommandRunner(runner) {
-    systemdCommandRunner = runner ?? defaultSystemdCommandRunner;
+Object.assign(SchedulerPlugin, {
+  __test__: {
+    cronToSystemdCalendars,
+    createSystemdTimer,
+    withSystemdRuntimeEnv,
+    systemdRunEnv,
+    installSystemdJob,
+    uninstallSystemdJob,
+    saveJob,
+    deleteJobFile,
+    jobFilePath,
+    SYSTEMD_USER_DIR,
+    SCOPES_DIR,
+    setSystemdCommandRunner(runner) {
+      systemdCommandRunner = runner ?? defaultSystemdCommandRunner;
+    }
   }
-};
+});
 export {
   src_default as default,
-  __test__,
   SchedulerPlugin
 };
