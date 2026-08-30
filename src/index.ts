@@ -838,7 +838,12 @@ function cronToSystemdCalendars(cron: string): string[] {
         for (const domValue of domValues) {
           for (const monthValue of months) {
             for (const dowValue of dowValues) {
-              calendars.push(`${dowValue} *-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
+              // systemd (see systemd.time(7)) does NOT accept "*" as a
+              // day-of-week prefix: "* *-09-06 10:00:00" fails to parse.
+              // Omit the weekday component entirely when it is a wildcard,
+              // producing the valid "y-m-d hh:mm:ss" form (year stays "*").
+              const weekdayPrefix = dowValue === "*" ? "" : `${dowValue} `
+              calendars.push(`${weekdayPrefix}*-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
             }
           }
         }
