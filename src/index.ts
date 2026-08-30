@@ -3399,3 +3399,23 @@ Commands:
 
 // Default export for OpenCode plugin system
 export default SchedulerPlugin
+
+// Exported for the repo's unit tests (bun test). This is not part of the
+// plugin's public API; do not rely on it from consumer code.
+export type { SystemdCommandRunner }
+export const __test__ = {
+  cronToSystemdCalendars,
+  createSystemdTimer,
+  withSystemdRuntimeEnv,
+  systemdRunEnv,
+  installSystemdJob,
+  uninstallSystemdJob,
+  saveJob,
+  deleteJobFile,
+  jobFilePath,
+  SYSTEMD_USER_DIR,
+  SCOPES_DIR,
+  setSystemdCommandRunner(runner: SystemdCommandRunner | null): void {
+    systemdCommandRunner = runner ?? defaultSystemdCommandRunner
+  },
+}
