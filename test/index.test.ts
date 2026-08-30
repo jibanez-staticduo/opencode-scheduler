@@ -18,7 +18,11 @@ import { existsSync, readFileSync, rmSync, statSync } from "fs"
 import { join } from "path"
 import { homedir, platform } from "os"
 import { spawnSync } from "child_process"
-import { __test__ } from "../src/index"
+import SchedulerPlugin from "../src/index"
+
+// Test internals live on the plugin function itself (opencode's loader only
+// accepts function exports, so they are not module-level bindings).
+const __test__ = (SchedulerPlugin as unknown as { __test__: any }).__test__
 
 const {
   cronToSystemdCalendars,
