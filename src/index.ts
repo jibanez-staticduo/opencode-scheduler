@@ -1273,18 +1273,38 @@ function installSystemdJob(job: Job): void {
 
   // Also stop/disable legacy units (pre-scope)
   try {
-    execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" })
-    execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" })
+    systemdExecSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" })
+    systemdExecSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" })
   } catch {}
 
-  // Write service and timer
-  writeFileSync(servicePath, createSystemdService(job))
-  writeFileSync(timerPath, createSystemdTimer(job))
+  // Write service and timer. Some environments (e.g. UGREEN NAS shells with a
+  // permissive umask) generate unit files with lax permissions that systemd
+  // rejects or warns about, so force 0644. writeFileSync `mode` only applies
+  // on file creation, hence the explicit chmod.
+  writeFileSync(servicePath, createSystemdService(job), { mode: 0o644 })
+  writeFileSync(timerPath, createSystemdTimer(job), { mode: 0o644 })
+  chmodSync(servicePath, 0o644)
+  chmodSync(timerPath, 0o644)
 
-  // Reload and enable
-  execSync("systemctl --user daemon-reload")
-  execSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`)
-  execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`)
+  // Reload and enable. If any systemctl step fails we must not leave freshly
+  // written unit files behind: the job JSON has already been persisted by the
+  // caller (and gets removed when this error propagates), so orphaned units
+  // here would be the inverse orphan. Roll the units back before rethrowing.
+  try {
+    systemdExecSync("systemctl --user daemon-reload")
+    systemdExecSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`)
+    systemdExecSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`)
+  } catch (error) {
+    for (const unitPath of [timerPath, servicePath]) {
+      try {
+        unlinkSync(unitPath)
+      } catch {}
+    }
+    try {
+      systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" })
+    } catch {}
+    throw error
+  }
 }
 
 function uninstallSystemdJob(job: Job): void {
