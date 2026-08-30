@@ -1,12 +1,16 @@
 // @bun
 var __defProp = Object.defineProperty;
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
 
@@ -10741,7 +10745,7 @@ class JSONSchemaGenerator {
               if (val === undefined) {
                 if (this.unrepresentable === "throw") {
                   throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-                } else {}
+                }
               } else if (typeof val === "bigint") {
                 if (this.unrepresentable === "throw") {
                   throw new Error("BigInt literals cannot be represented in JSON Schema");
@@ -12331,7 +12335,7 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // src/index.ts
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
+import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
 import { basename, dirname, join, resolve as resolvePath } from "path";
 import { homedir, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
@@ -12983,7 +12987,8 @@ function cronToSystemdCalendars(cron) {
         for (const domValue of domValues) {
           for (const monthValue of months) {
             for (const dowValue of dowValues) {
-              calendars.push(`${dowValue} *-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`);
+              const weekdayPrefix = dowValue === "*" ? "" : `${dowValue} `;
+              calendars.push(`${weekdayPrefix}*-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`);
             }
           }
         }
@@ -13220,6 +13225,40 @@ function uninstallLaunchdJob(job) {
     } catch {}
   }
 }
+function withSystemdRuntimeEnv(env) {
+  const next = { ...env };
+  if (!next.XDG_RUNTIME_DIR) {
+    const uid = process.getuid?.();
+    if (typeof uid === "number") {
+      const runtimeDir = `/run/user/${uid}`;
+      if (existsSync(runtimeDir)) {
+        next.XDG_RUNTIME_DIR = runtimeDir;
+      }
+    }
+  }
+  if (!next.DBUS_SESSION_BUS_ADDRESS && next.XDG_RUNTIME_DIR) {
+    const busPath = join(next.XDG_RUNTIME_DIR, "bus");
+    if (existsSync(busPath)) {
+      next.DBUS_SESSION_BUS_ADDRESS = `unix:path=${busPath}`;
+    }
+  }
+  return next;
+}
+function systemdRunEnv() {
+  const enhancedPath = getEnhancedPath();
+  const existingPath = process.env.PATH;
+  return withSystemdRuntimeEnv({
+    ...process.env,
+    PATH: existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath
+  });
+}
+function defaultSystemdCommandRunner(command, options) {
+  return execSync(command, { ...options, env: systemdRunEnv() });
+}
+var systemdCommandRunner = defaultSystemdCommandRunner;
+function systemdExecSync(command, options) {
+  return systemdCommandRunner(command, options);
+}
 function createSystemdService(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   const logFilePath = scopedLogPath(scopeId, job.slug);
@@ -13266,14 +13305,28 @@ function installSystemdJob(job) {
   const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
   const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
   try {
-    execSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" });
-    execSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" });
+    systemdExecSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" });
+    systemdExecSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" });
   } catch {}
-  writeFileSync(servicePath, createSystemdService(job));
-  writeFileSync(timerPath, createSystemdTimer(job));
-  execSync("systemctl --user daemon-reload");
-  execSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`);
-  execSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`);
+  writeFileSync(servicePath, createSystemdService(job), { mode: 420 });
+  writeFileSync(timerPath, createSystemdTimer(job), { mode: 420 });
+  chmodSync(servicePath, 420);
+  chmodSync(timerPath, 420);
+  try {
+    systemdExecSync("systemctl --user daemon-reload");
+    systemdExecSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`);
+    systemdExecSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`);
+  } catch (error45) {
+    for (const unitPath of [timerPath, servicePath]) {
+      try {
+        unlinkSync(unitPath);
+      } catch {}
+    }
+    try {
+      systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" });
+    } catch {}
+    throw error45;
+  }
 }
 function uninstallSystemdJob(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
@@ -13281,8 +13334,8 @@ function uninstallSystemdJob(job) {
   const legacyTimerUnit = `opencode-job-${job.slug}.timer`;
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
     try {
-      execSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" });
-      execSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
+      systemdExecSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" });
+      systemdExecSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
     } catch {}
   }
   const scopedServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
@@ -13297,7 +13350,7 @@ function uninstallSystemdJob(job) {
     }
   }
   try {
-    execSync("systemctl --user daemon-reload", { stdio: "ignore" });
+    systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" });
   } catch {}
 }
 function installWindowsJob(job) {
@@ -13339,9 +13392,8 @@ function isSystemdUserAvailable() {
   if (!isCommandAvailable("systemctl"))
     return false;
   try {
-    execSync("systemctl --user show-environment", {
-      stdio: "ignore",
-      env: buildRunEnvironment()
+    systemdExecSync("systemctl --user show-environment", {
+      stdio: "ignore"
     });
     return true;
   } catch {
@@ -14967,7 +15019,24 @@ ${logs}`, { job, logPath, logs });
   };
 };
 var src_default = SchedulerPlugin;
+var __test__ = {
+  cronToSystemdCalendars,
+  createSystemdTimer,
+  withSystemdRuntimeEnv,
+  systemdRunEnv,
+  installSystemdJob,
+  uninstallSystemdJob,
+  saveJob,
+  deleteJobFile,
+  jobFilePath,
+  SYSTEMD_USER_DIR,
+  SCOPES_DIR,
+  setSystemdCommandRunner(runner) {
+    systemdCommandRunner = runner ?? defaultSystemdCommandRunner;
+  }
+};
 export {
   src_default as default,
+  __test__,
   SchedulerPlugin
 };

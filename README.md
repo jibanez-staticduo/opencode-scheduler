@@ -10,13 +10,41 @@ This is an [OpenCode](https://opencode.ai) plugin that uses your OS's native sch
 
 As of `v1.2.0`, jobs are scoped by `workdir` (so different projects don't collide), and scheduled runs are supervised (no overlap + optional timeout).
 
+## Fork changes (jibanez-staticduo, published as `@staticduo/opencode-scheduler`)
+
+This fork contains three Linux/systemd fixes over upstream `v1.3.0`:
+
+1. **`cronToSystemdCalendars` emitted invalid `OnCalendar` values.** The
+   weekday component was always prefixed, even when the cron day-of-week field
+   is a wildcard, producing expressions like `* *-09-06 10:00:00`. systemd
+   does not accept `*` as a day-of-week, so every timer generated from such
+   schedules failed to parse. The fork omits the weekday prefix for wildcards
+   (e.g. `*-*-* 09:00:00`, `*-09-06 10:00:00`) and keeps generating both
+   valid variants when day-of-month and day-of-week are both fixed.
+2. **Failed systemd installs orphaned unit files.** `installSystemdJob` wrote
+   the `.service`/`.timer` units and then ran
+   `daemon-reload`/`enable`/`start`; if any of those systemctl calls failed,
+   the tool-level error handler removed the job JSON but left the unit files
+   behind (units without jobs). The fork rolls back freshly written units
+   before propagating the error, so neither units nor job JSON are orphaned.
+3. **`systemctl --user` calls inherited an incomplete environment.** When the
+   parent `opencode` process is started without `XDG_RUNTIME_DIR` (and
+   `DBUS_SESSION_BUS_ADDRESS`), every systemctl call failed with
+   `Failed to connect to bus` even though the user manager was running. All
+   systemctl invocations now go through a helper that derives
+   `XDG_RUNTIME_DIR=/run/user/<uid>` (and the bus address) when they exist.
+   Unit files are additionally written with mode `0644`, because hosts with a
+   lax umask (e.g. UGREEN NAS) generated permissions systemd complains about.
+
+Unit tests for these fixes live in `test/` (`bun test`).
+
 ## Install
 
 Add to your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-scheduler"]
+  "plugin": ["@staticduo/opencode-scheduler"]
 }
 ```
 
