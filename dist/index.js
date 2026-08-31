@@ -12336,7 +12336,7 @@ function tool(input) {
 tool.schema = exports_external;
 // src/index.ts
 import { createWriteStream, existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync, readFileSync as readFileSync2, rmSync as rmSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
-import { dirname, join as join2, resolve as resolvePath } from "path";
+import { dirname, join as join3, resolve as resolvePath } from "path";
 import { homedir, platform } from "os";
 import { execFileSync as execFileSync2, spawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -12936,20 +12936,58 @@ function isSafeIdentifier(value) {
   return SAFE_IDENTIFIER2.test(value);
 }
 
+// src/executable.ts
+import { accessSync, constants, statSync as statSync2 } from "fs";
+import { delimiter, isAbsolute, join as join2, win32 } from "path";
+var defaults = {
+  access: accessSync,
+  isFile: (path) => statSync2(path).isFile(),
+  cwd: process.cwd,
+  platform: process.platform
+};
+function candidates(command, pathValue, pathExt, dependencies) {
+  const windows = dependencies.platform === "win32";
+  const pathDelimiter = windows ? win32.delimiter : delimiter;
+  const pathJoin = windows ? win32.join : join2;
+  const absolute = windows ? win32.isAbsolute(command) : isAbsolute(command);
+  const extensions = windows ? (pathExt ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
+  const names = windows && !extensions.some((extension) => command.toLowerCase().endsWith(extension.toLowerCase())) ? extensions.map((extension) => `${command}${extension}`) : [command];
+  if (absolute)
+    return names;
+  return pathValue.split(pathDelimiter).flatMap((entry) => {
+    const directory = entry || dependencies.cwd();
+    return names.map((name) => pathJoin(directory, name));
+  });
+}
+function resolveExecutable(command, env, dependencies = defaults) {
+  const absolute = dependencies.platform === "win32" ? win32.isAbsolute(command) : isAbsolute(command);
+  if (!command || !absolute && /[\\/]/.test(command))
+    return null;
+  for (const candidate of candidates(command, env.PATH ?? "", env.PATHEXT, dependencies)) {
+    try {
+      if (!dependencies.isFile(candidate))
+        continue;
+      dependencies.access(candidate, dependencies.platform === "win32" ? constants.F_OK : constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return null;
+}
+
 // src/index.ts
-var OPENCODE_CONFIG = join2(homedir(), ".config", "opencode");
-var LEGACY_JOBS_DIR = join2(OPENCODE_CONFIG, "jobs");
-var LOGS_DIR = join2(OPENCODE_CONFIG, "logs");
-var SCHEDULER_DIR = join2(OPENCODE_CONFIG, "scheduler");
-var SCOPES_DIR = join2(SCHEDULER_DIR, "scopes");
-var SUPERVISOR_PATH = join2(SCHEDULER_DIR, "supervisor.pl");
-var SCHEDULER_CONFIG = join2(OPENCODE_CONFIG, "opencode-scheduler.json");
+var OPENCODE_CONFIG = join3(homedir(), ".config", "opencode");
+var LEGACY_JOBS_DIR = join3(OPENCODE_CONFIG, "jobs");
+var LOGS_DIR = join3(OPENCODE_CONFIG, "logs");
+var SCHEDULER_DIR = join3(OPENCODE_CONFIG, "scheduler");
+var SCOPES_DIR = join3(SCHEDULER_DIR, "scopes");
+var SUPERVISOR_PATH = join3(SCHEDULER_DIR, "supervisor.pl");
+var SCHEDULER_CONFIG = join3(OPENCODE_CONFIG, "opencode-scheduler.json");
 var IS_MAC = platform() === "darwin";
 var IS_LINUX = platform() === "linux";
 var IS_WINDOWS = platform() === "win32";
-var LAUNCH_AGENTS_DIR = join2(homedir(), "Library", "LaunchAgents");
+var LAUNCH_AGENTS_DIR = join3(homedir(), "Library", "LaunchAgents");
 var LAUNCHD_PREFIX = "com.opencode.job";
-var SYSTEMD_USER_DIR = join2(homedir(), ".config", "systemd", "user");
+var SYSTEMD_USER_DIR = join3(homedir(), ".config", "systemd", "user");
 var WINDOWS_TASK_ROOT = "\\OpenCode";
 var WINDOWS_TASK_PREFIX = "opencode-job";
 var CRON_MANAGED_PREFIX = "opencode-scheduler";
@@ -12992,25 +13030,25 @@ function deriveScopeId(workdir) {
   return deriveSafeScopeId(normalizeWorkdirPath(workdir));
 }
 function scopeDir(scopeId) {
-  return join2(SCOPES_DIR, scopeId);
+  return join3(SCOPES_DIR, scopeId);
 }
 function scopeJobsDir(scopeId) {
-  return join2(scopeDir(scopeId), "jobs");
+  return join3(scopeDir(scopeId), "jobs");
 }
 function scopeLocksDir(scopeId) {
-  return join2(scopeDir(scopeId), "locks");
+  return join3(scopeDir(scopeId), "locks");
 }
 function scopeRunsDir(scopeId) {
-  return join2(scopeDir(scopeId), "runs");
+  return join3(scopeDir(scopeId), "runs");
 }
 function scopeLogsDir(scopeId) {
-  return join2(LOGS_DIR, "scheduler", scopeId);
+  return join3(LOGS_DIR, "scheduler", scopeId);
 }
 function jobFilePath(scopeId, slug) {
-  return join2(scopeJobsDir(scopeId), `${slug}.json`);
+  return join3(scopeJobsDir(scopeId), `${slug}.json`);
 }
 function scopedLogPath(scopeId, slug) {
-  return join2(scopeLogsDir(scopeId), `${slug}.log`);
+  return join3(scopeLogsDir(scopeId), `${slug}.log`);
 }
 function currentScopeId() {
   return deriveScopeId(process.cwd());
@@ -13401,11 +13439,11 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
     throw new Error(`Directory not found: ${installRoot}`);
   }
   const relativeDir = dirname(skill.suggestedPath);
-  const installDir = join2(installRoot, relativeDir);
+  const installDir = join3(installRoot, relativeDir);
   ensureDir(installDir);
   const files = [];
   for (const [filename, content] of Object.entries(skill.files)) {
-    const targetPath = join2(installDir, filename);
+    const targetPath = join3(installDir, filename);
     if (existsSync2(targetPath) && !overwrite) {
       throw new Error(`File already exists: ${targetPath} (pass overwrite=true to replace)`);
     }
@@ -13418,7 +13456,7 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
 function loadPackageInfo() {
   const fallback = { name: "opencode-scheduler", version: "unknown" };
   try {
-    const packagePath = join2(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const packagePath = join3(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
     const raw = readFileSync2(packagePath, "utf-8");
     const parsed = JSON.parse(raw);
     return {
@@ -13443,7 +13481,7 @@ function findOpencode() {
   const paths = [
     "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
-    join2(homedir(), ".opencode", "bin", "opencode")
+    join3(homedir(), ".opencode", "bin", "opencode")
   ];
   for (const p of paths) {
     if (existsSync2(p)) {
@@ -13700,9 +13738,9 @@ function installLaunchdJob(job) {
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join3(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const plistPath = join2(LAUNCH_AGENTS_DIR, `${label}.plist`);
+  const plistPath = join3(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
     execFileSync2("launchctl", ["unload", plistPath], { stdio: "ignore" });
   } catch {}
@@ -13719,9 +13757,9 @@ function uninstallLaunchdJob(job) {
   validateJobIdentifiers(job);
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const scopedPlistPath = join2(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
+  const scopedPlistPath = join3(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join3(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
     if (!existsSync2(plistPath))
       continue;
@@ -13791,13 +13829,13 @@ function installSystemdJob(job, run = defaultSystemdCommandRunner) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
-  const servicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const timerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const servicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const timerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
   const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1);
   const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1);
   installSystemdUnits({
     unitDir: SYSTEMD_USER_DIR,
-    lockDir: join2(SCHEDULER_DIR, "systemd-install-locks"),
+    lockDir: join3(SCHEDULER_DIR, "systemd-install-locks"),
     serviceUnit,
     timerUnit,
     lockKey: `opencode-job-${job.slug}`,
@@ -13823,10 +13861,10 @@ function uninstallSystemdJob(job) {
       systemdExecSync(["--user", "disable", timerUnit], { stdio: "ignore" });
     } catch {}
   }
-  const scopedServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const scopedTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
-  const legacyServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
-  const legacyTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
+  const scopedServicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const scopedTimerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const legacyServicePath = join3(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
+  const legacyTimerPath = join3(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
   for (const p of [scopedServicePath, scopedTimerPath, legacyServicePath, legacyTimerPath]) {
     if (existsSync2(p)) {
       try {
@@ -13848,15 +13886,15 @@ function installWindowsJob(job) {
 }
 function uninstallWindowsJob(job) {
   validateJobIdentifiers(job);
-  const candidates = new Set;
+  const candidates2 = new Set;
   const scopedBase = windowsTaskBaseName(job);
   const legacyBase = `${WINDOWS_TASK_PREFIX}-${job.slug}`;
   for (let i = 0;i < 64; i += 1) {
     const suffix = i === 0 ? "" : `-${i + 1}`;
-    candidates.add(`${WINDOWS_TASK_ROOT}\\${scopedBase}${suffix}`);
-    candidates.add(`${WINDOWS_TASK_ROOT}\\${legacyBase}${suffix}`);
+    candidates2.add(`${WINDOWS_TASK_ROOT}\\${scopedBase}${suffix}`);
+    candidates2.add(`${WINDOWS_TASK_ROOT}\\${legacyBase}${suffix}`);
   }
-  for (const taskName of candidates) {
+  for (const taskName of candidates2) {
     try {
       execFileSync2("schtasks", ["/Delete", "/TN", taskName, "/F"], { stdio: "ignore" });
     } catch {}
@@ -13865,15 +13903,7 @@ function uninstallWindowsJob(job) {
 function isCommandAvailable(command) {
   if (!/^[a-z0-9][a-z0-9-]*$/.test(command))
     return false;
-  try {
-    execFileSync2(command, ["--version"], {
-      stdio: "ignore",
-      env: buildRunEnvironment()
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  return resolveExecutable(command, buildRunEnvironment()) !== null;
 }
 function isSystemdUserAvailable() {
   if (!IS_LINUX)
@@ -14076,7 +14106,7 @@ function loadAllScopedJobs(scopeId) {
   const files = readdirSync(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync2(join2(scopeJobsDir(scopeId), f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync2(join3(scopeJobsDir(scopeId), f), "utf-8")));
     } catch {
       return null;
     }
@@ -14106,7 +14136,7 @@ function loadAllJobsAcrossScopes() {
 }
 function loadLegacyJob(slug) {
   ensureDir(LEGACY_JOBS_DIR);
-  const path = join2(LEGACY_JOBS_DIR, `${slug}.json`);
+  const path = join3(LEGACY_JOBS_DIR, `${slug}.json`);
   if (!existsSync2(path))
     return null;
   try {
@@ -14120,7 +14150,7 @@ function loadAllLegacyJobs() {
   const files = readdirSync(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync2(join2(LEGACY_JOBS_DIR, f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync2(join3(LEGACY_JOBS_DIR, f), "utf-8")));
     } catch {
       return null;
     }
@@ -14145,7 +14175,7 @@ function listDirectoryFiles(dir, options) {
     return [];
   try {
     const entries = readdirSync(dir, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join2(dir, name)).sort();
+    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join3(dir, name)).sort();
   } catch {
     return [];
   }
@@ -14167,9 +14197,9 @@ function buildGlobalCleanupPlan(includeHistory) {
   const scopedJobDefinitionPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeJobsDir(scopeId), { suffix: ".json" }));
   const lockPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeLocksDir(scopeId), { suffix: ".json" }));
   const runHistoryPaths = includeHistory ? scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeRunsDir(scopeId), { suffix: ".jsonl" })) : [];
-  const schedulerLogsRoot = join2(LOGS_DIR, "scheduler");
+  const schedulerLogsRoot = join3(LOGS_DIR, "scheduler");
   const logScopeIds = listDirectoryNames(schedulerLogsRoot);
-  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join2(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
+  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join3(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
   const launchdPaths = IS_MAC ? listDirectoryFiles(LAUNCH_AGENTS_DIR, { prefix: `${LAUNCHD_PREFIX}.`, suffix: ".plist" }) : [];
   const systemdPaths = IS_LINUX ? [
     ...listDirectoryFiles(SYSTEMD_USER_DIR, { prefix: "opencode-job-", suffix: ".service" }),
@@ -15342,7 +15372,7 @@ ${content.trim()}
           }
           uninstallJob(job);
           deleteJobFile(job);
-          const legacyPath = join2(LEGACY_JOBS_DIR, `${job.slug}.json`);
+          const legacyPath = join3(LEGACY_JOBS_DIR, `${job.slug}.json`);
           if (existsSync2(legacyPath)) {
             try {
               unlinkSync2(legacyPath);

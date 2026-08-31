@@ -22,6 +22,7 @@ import { cronToSystemdCalendars } from "../src/cron"
 import { installLinuxScheduler, installSystemdWithCronFallback } from "../src/backend"
 import { readExecutableVersion } from "../src/process"
 import { deriveSafeScopeId } from "../src/identifiers"
+import { resolveExecutable, type ExecutableProbeDependencies } from "../src/executable"
 import {
   installSystemdUnits,
   SystemdFallbackSafeError,
@@ -110,6 +111,37 @@ describe("safe executable version probing", () => {
       expect(calls).toEqual([{ file: executable, args: ["--version"] }])
     })
   }
+})
+
+describe("shell-free executable resolution", () => {
+  const dependencies = (files: Set<string>, platform: NodeJS.Platform = "linux"): ExecutableProbeDependencies => ({
+    platform,
+    cwd: () => "/cwd",
+    isFile: (path) => files.has(path),
+    access: (path) => { if (!files.has(path)) throw new Error("EACCES") },
+  })
+
+  test("finds crontab without executing its unsupported --version flag", () => {
+    expect(resolveExecutable("crontab", { PATH: "/usr/bin:/bin" }, dependencies(new Set(["/usr/bin/crontab"])))).toBe("/usr/bin/crontab")
+  })
+
+  test("returns false for missing and non-executable candidates", () => {
+    const probe = dependencies(new Set(["/usr/bin/crontab"]))
+    probe.access = () => { throw new Error("EACCES") }
+    expect(resolveExecutable("crontab", { PATH: "/usr/bin" }, probe)).toBeNull()
+    expect(resolveExecutable("missing", { PATH: "/usr/bin" }, dependencies(new Set()))).toBeNull()
+  })
+
+  test("treats PATH metacharacters literally and empty entry as cwd", () => {
+    const files = new Set(["/literal;$(touch pwn)/crontab", "/cwd/tool"])
+    expect(resolveExecutable("crontab", { PATH: "/literal;$(touch pwn)" }, dependencies(files))).toBe("/literal;$(touch pwn)/crontab")
+    expect(resolveExecutable("tool", { PATH: "" }, dependencies(files))).toBe("/cwd/tool")
+  })
+
+  test("uses PATHEXT candidates on Windows without execution", () => {
+    const files = new Set(["C:\\bin\\crontab.EXE"])
+    expect(resolveExecutable("crontab", { PATH: "C:\\bin", PATHEXT: ".EXE;.CMD" }, dependencies(files, "win32"))).toBe("C:\\bin\\crontab.EXE")
+  })
 })
 
 describe("identifier length compatibility", () => {

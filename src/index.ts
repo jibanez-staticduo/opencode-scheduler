@@ -23,6 +23,7 @@ import { installSystemdUnits, type SystemdCommandRunner, withSystemdRuntimeEnv }
 import { installLinuxScheduler } from "./backend"
 import { readExecutableVersion } from "./process"
 import { deriveSafeScopeId, isSafeIdentifier, NAME_MAX_BYTES } from "./identifiers"
+import { resolveExecutable } from "./executable"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -1206,15 +1207,7 @@ type SchedulerBackend = "launchd" | "systemd" | "schtasks" | "cron"
 
 function isCommandAvailable(command: string): boolean {
   if (!/^[a-z0-9][a-z0-9-]*$/.test(command)) return false
-  try {
-    execFileSync(command, ["--version"], {
-      stdio: "ignore",
-      env: buildRunEnvironment(),
-    })
-    return true
-  } catch {
-    return false
-  }
+  return resolveExecutable(command, buildRunEnvironment()) !== null
 }
 
 function isSystemdUserAvailable(): boolean {
