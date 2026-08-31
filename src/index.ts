@@ -65,6 +65,14 @@ function slugify(name: string): string {
     .replace(/^-|-$/g, "")
 }
 
+const SAFE_JOB_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/
+
+function validateJobIdentifiers(job: Job): void {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
+  if (!SAFE_JOB_IDENTIFIER.test(scopeId)) throw new Error(`Invalid job scopeId: ${JSON.stringify(scopeId)}`)
+  if (!SAFE_JOB_IDENTIFIER.test(job.slug)) throw new Error(`Invalid job slug: ${JSON.stringify(job.slug)}`)
+}
+
 function normalizeWorkdirPath(input: string): string {
   const trimmed = input.trim()
   if (!trimmed) return homedir()
@@ -980,6 +988,7 @@ ${calendarXml}
 
 
 function installLaunchdJob(job: Job): void {
+  validateJobIdentifiers(job)
   ensureDir(LAUNCH_AGENTS_DIR)
   ensureDir(LOGS_DIR)
 
@@ -995,13 +1004,13 @@ function installLaunchdJob(job: Job): void {
 
   // Unload if exists
   try {
-    execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" })
+    execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" })
   } catch {}
 
   // Also unload legacy label (pre-scope)
   if (existsSync(legacyPlistPath)) {
     try {
-      execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" })
+      execFileSync("launchctl", ["unload", legacyPlistPath], { stdio: "ignore" })
     } catch {}
   }
 
@@ -1010,10 +1019,11 @@ function installLaunchdJob(job: Job): void {
   writeFileSync(plistPath, plist)
 
   // Load
-  execSync(`launchctl load "${plistPath}"`)
+  execFileSync("launchctl", ["load", plistPath])
 }
 
 function uninstallLaunchdJob(job: Job): void {
+  validateJobIdentifiers(job)
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`
   const scopedPlistPath = join(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`)
@@ -1024,7 +1034,7 @@ function uninstallLaunchdJob(job: Job): void {
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
     if (!existsSync(plistPath)) continue
     try {
-      execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" })
+      execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" })
     } catch {}
     try {
       unlinkSync(plistPath)
@@ -1053,14 +1063,15 @@ function systemdRunEnv(): NodeJS.ProcessEnv {
 }
 
 function defaultSystemdCommandRunner(
-  command: string,
-  options?: Parameters<typeof execSync>[1]
+  executable: "systemctl",
+  args: readonly string[],
+  options?: Parameters<typeof execFileSync>[2]
 ): Buffer | string {
-  return execSync(command, { ...options, env: systemdRunEnv() })
+  return execFileSync(executable, [...args], { ...options, env: systemdRunEnv() }) as Buffer | string
 }
 
-function systemdExecSync(command: string, options?: Parameters<typeof execSync>[1]): Buffer | string {
-  return defaultSystemdCommandRunner(command, options)
+function systemdExecSync(args: readonly string[], options?: Parameters<typeof execFileSync>[2]): Buffer | string {
+  return defaultSystemdCommandRunner("systemctl", args, options)
 }
 
 function createSystemdService(job: Job): string {
@@ -1107,6 +1118,7 @@ WantedBy=timers.target
 }
 
 function installSystemdJob(job: Job, run: SystemdCommandRunner = defaultSystemdCommandRunner): void {
+  validateJobIdentifiers(job)
   ensureDir(SYSTEMD_USER_DIR)
   ensureDir(LOGS_DIR)
 
@@ -1119,7 +1131,6 @@ function installSystemdJob(job: Job, run: SystemdCommandRunner = defaultSystemdC
 
   const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1)
   const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1)
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(job.slug)) throw new Error(`Invalid job slug for systemd unit: ${job.slug}`)
   installSystemdUnits({
     unitDir: SYSTEMD_USER_DIR,
     lockDir: join(SCHEDULER_DIR, "systemd-install-locks"),
@@ -1139,6 +1150,7 @@ function installSystemdJob(job: Job, run: SystemdCommandRunner = defaultSystemdC
 }
 
 function uninstallSystemdJob(job: Job): void {
+  validateJobIdentifiers(job)
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
 
   const scopedTimerUnit = `opencode-job-${scopeId}-${job.slug}.timer`
@@ -1146,8 +1158,8 @@ function uninstallSystemdJob(job: Job): void {
 
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
     try {
-      systemdExecSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" })
-      systemdExecSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
+      systemdExecSync(["--user", "stop", timerUnit], { stdio: "ignore" })
+      systemdExecSync(["--user", "disable", timerUnit], { stdio: "ignore" })
     } catch {}
   }
 
@@ -1165,13 +1177,14 @@ function uninstallSystemdJob(job: Job): void {
   }
 
   try {
-    systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" })
+    systemdExecSync(["--user", "daemon-reload"], { stdio: "ignore" })
   } catch {}
 }
 
 // === WINDOWS TASK SCHEDULER ===
 
 function installWindowsJob(job: Job): void {
+  validateJobIdentifiers(job)
   // Remove stale task variants before (re)creating current definitions.
   uninstallWindowsJob(job)
 
@@ -1182,6 +1195,7 @@ function installWindowsJob(job: Job): void {
 }
 
 function uninstallWindowsJob(job: Job): void {
+  validateJobIdentifiers(job)
   const candidates = new Set<string>()
   const scopedBase = windowsTaskBaseName(job)
   const legacyBase = `${WINDOWS_TASK_PREFIX}-${job.slug}`
@@ -1219,7 +1233,7 @@ function isSystemdUserAvailable(): boolean {
   if (!IS_LINUX) return false
   if (!isCommandAvailable("systemctl")) return false
   try {
-    systemdExecSync("systemctl --user show-environment", {
+    systemdExecSync(["--user", "show-environment"], {
       stdio: "ignore",
     })
     return true
@@ -1374,6 +1388,7 @@ function resolveSchedulerBackend(): SchedulerBackend {
 }
 
 function installJob(job: Job): SchedulerBackend {
+  validateJobIdentifiers(job)
   const backend = resolveSchedulerBackend()
   if (backend === "launchd") {
     installLaunchdJob(job)
@@ -1391,6 +1406,7 @@ function installJob(job: Job): SchedulerBackend {
 }
 
 function uninstallJob(job: Job): void {
+  validateJobIdentifiers(job)
   if (IS_MAC) {
     uninstallLaunchdJob(job)
     return

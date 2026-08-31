@@ -103,7 +103,8 @@ interface FakeState {
 }
 
 function fakeRunner(state: FakeState, failure?: FailurePoint): SystemdCommandRunner {
-  return (command) => {
+  return (_executable, args) => {
+    const command = args.join(" ")
     state.calls.push(command)
     if (command.includes("is-enabled")) return Buffer.from(`${state.unitFileState}\n`)
     if (command.includes("is-active")) return Buffer.from(state.active ? "active\n" : "inactive\n")
@@ -161,6 +162,44 @@ function install(root: string, state: FakeState, failure?: FailurePoint, lock?: 
 }
 
 describe("installSystemdUnits transaction", () => {
+  for (const value of ["bad;id", "$(id)", "bad\nunit", "bad/unit", "-leading", "bad name"] as const) {
+    test(`rejects unsafe unit and lock identifiers before mutation: ${JSON.stringify(value)}`, () => {
+      const root = sandbox()
+      let runnerCalls = 0
+      const run: SystemdCommandRunner = () => { runnerCalls += 1; return Buffer.alloc(0) }
+      expect(() => installSystemdUnits({
+        unitDir: root,
+        serviceUnit: `${value}.service`,
+        timerUnit: "job.timer",
+        lockKey: value,
+        serviceContent: "new",
+        timerContent: "new",
+        run,
+      })).toThrow("Invalid")
+      expect(runnerCalls).toBe(0)
+      expect(existsSync(join(root, "job.timer"))).toBe(false)
+      expect(existsSync(join(root, ".opencode-scheduler-locks"))).toBe(false)
+    })
+  }
+
+  test("passes validated units as typed argv without shell construction", () => {
+    const root = sandbox()
+    const invocations: Array<{ executable: string; args: readonly string[] }> = []
+    let enabled = false
+    let active = false
+    const run: SystemdCommandRunner = (executable, args) => {
+      invocations.push({ executable, args })
+      if (args[1] === "is-enabled") return Buffer.from(enabled ? "enabled\n" : "disabled\n")
+      if (args[1] === "is-active") return Buffer.from(active ? "active\n" : "inactive\n")
+      if (args[1] === "enable") enabled = true
+      if (args[1] === "start") active = true
+      return Buffer.alloc(0)
+    }
+    installSystemdUnits({ unitDir: root, serviceUnit: "job.service", timerUnit: "job.timer", lockKey: "real-scope-123", serviceContent: "new", timerContent: "new", run })
+    expect(invocations.every((call) => call.executable === "systemctl")).toBe(true)
+    expect(invocations).toContainEqual({ executable: "systemctl", args: ["--user", "enable", "job.timer"] })
+    expect(invocations).toContainEqual({ executable: "systemctl", args: ["--user", "start", "job.timer"] })
+  })
   test("aborts before mutation when prior timer state cannot be captured", () => {
     const root = sandbox()
     const service = join(root, "job.service")
@@ -233,7 +272,8 @@ describe("installSystemdUnits transaction", () => {
       ["legacy.timer", { enabled: "enabled", active: true }],
     ])
     const calls: string[] = []
-    const run: SystemdCommandRunner = (command) => {
+    const run: SystemdCommandRunner = (_executable, args) => {
+    const command = args.join(" ")
       calls.push(command)
       const unit = command.split(" ").at(-1)!
       const state = states.get(unit)
@@ -287,7 +327,8 @@ describe("installSystemdUnits transaction", () => {
           writeFileSync(path, data, options)
         },
       }
-      const run: SystemdCommandRunner = (command) => {
+      const run: SystemdCommandRunner = (_executable, args) => {
+    const command = args.join(" ")
         calls.push(command)
         const unit = command.split(" ").at(-1)!
         const state = states.get(unit)
@@ -335,7 +376,8 @@ describe("installSystemdUnits transaction", () => {
       const calls: string[] = []
       let legacyActive = true
       let scopedActive = false
-      const run: SystemdCommandRunner = (command) => {
+      const run: SystemdCommandRunner = (_executable, args) => {
+    const command = args.join(" ")
         calls.push(command)
         if (command.includes("is-enabled legacy.timer")) return Buffer.from(`${legacyState}\n`)
         if (command.includes("is-active legacy.timer")) return Buffer.from(legacyActive ? "active\n" : "inactive\n")

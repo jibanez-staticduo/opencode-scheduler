@@ -12447,6 +12447,19 @@ import {
   writeFileSync
 } from "fs";
 import { join } from "path";
+var SAFE_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/;
+var SAFE_UNIT = /^[a-z0-9][a-z0-9-]{0,127}\.(service|timer)$/;
+function validateInstallRequest(request) {
+  const invalid = (label, value, pattern) => {
+    if (value !== undefined && !pattern.test(value))
+      throw new Error(`Invalid ${label}: ${JSON.stringify(value)}`);
+  };
+  invalid("service unit", request.serviceUnit, SAFE_UNIT);
+  invalid("timer unit", request.timerUnit, SAFE_UNIT);
+  invalid("legacy service unit", request.legacyServiceUnit, SAFE_UNIT);
+  invalid("legacy timer unit", request.legacyTimerUnit, SAFE_UNIT);
+  invalid("lock key", request.lockKey, SAFE_IDENTIFIER);
+}
 
 class SystemdNonFallbackError extends Error {
   fallbackSafe = false;
@@ -12601,7 +12614,7 @@ function commandOutput(value) {
 function queryUnitFileState(run, timerUnit) {
   let output = "";
   try {
-    output = commandOutput(run(`systemctl --user is-enabled ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }));
+    output = commandOutput(run("systemctl", ["--user", "is-enabled", timerUnit], { stdio: ["ignore", "pipe", "ignore"] }));
   } catch (error45) {
     output = commandOutput(error45);
   }
@@ -12629,7 +12642,7 @@ function queryUnitFileState(run, timerUnit) {
 function queryActiveState(run, timerUnit) {
   let output = "";
   try {
-    output = commandOutput(run(`systemctl --user is-active ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }));
+    output = commandOutput(run("systemctl", ["--user", "is-active", timerUnit], { stdio: ["ignore", "pipe", "ignore"] }));
   } catch (error45) {
     output = commandOutput(error45);
   }
@@ -12663,11 +12676,11 @@ function attempt(action) {
 }
 function restoreUnitFileState(run, timerUnit, state) {
   if (state === "enabled")
-    run(`systemctl --user enable ${timerUnit}`, { stdio: "ignore" });
+    run("systemctl", ["--user", "enable", timerUnit], { stdio: "ignore" });
   if (state === "enabled-runtime")
-    run(`systemctl --user enable --runtime ${timerUnit}`, { stdio: "ignore" });
+    run("systemctl", ["--user", "enable", "--runtime", timerUnit], { stdio: "ignore" });
   if (state === "disabled")
-    run(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
+    run("systemctl", ["--user", "disable", timerUnit], { stdio: "ignore" });
 }
 function isErrorCode(error45, code) {
   return typeof error45 === "object" && error45 !== null && "code" in error45 && error45.code === code;
@@ -12771,6 +12784,7 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
   }
 }
 function installSystemdUnits(request) {
+  validateInstallRequest(request);
   const fileSystem = request.fileSystem ?? defaultFileSystem;
   let lockHandle;
   try {
@@ -12798,8 +12812,8 @@ function installSystemdUnits(request) {
     let enabledByAttempt = false;
     try {
       if (legacyRelevant) {
-        request.run(`systemctl --user stop ${request.legacyTimerUnit}`);
-        request.run(`systemctl --user disable ${request.legacyTimerUnit}`);
+        request.run("systemctl", ["--user", "stop", request.legacyTimerUnit]);
+        request.run("systemctl", ["--user", "disable", request.legacyTimerUnit]);
         if (legacyServiceSnapshot)
           restoreFile(legacyServiceSnapshot, fileSystem);
         if (legacyTimerSnapshot)
@@ -12807,32 +12821,32 @@ function installSystemdUnits(request) {
       }
       atomicReplace(servicePath, request.serviceContent, 420, fileSystem);
       atomicReplace(timerPath, request.timerContent, 420, fileSystem);
-      request.run("systemctl --user daemon-reload");
+      request.run("systemctl", ["--user", "daemon-reload"]);
       if (legacyRelevant)
-        request.run(`systemctl --user stop ${request.legacyTimerUnit}`);
-      request.run(`systemctl --user enable ${request.timerUnit}`);
+        request.run("systemctl", ["--user", "stop", request.legacyTimerUnit]);
+      request.run("systemctl", ["--user", "enable", request.timerUnit]);
       enabledByAttempt = true;
-      request.run(`systemctl --user start ${request.timerUnit}`);
+      request.run("systemctl", ["--user", "start", request.timerUnit]);
     } catch (error45) {
       let rollbackComplete = true;
       if (!wasActive)
-        rollbackComplete = attempt(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
+        rollbackComplete = attempt(() => request.run("systemctl", ["--user", "stop", request.timerUnit], { stdio: "ignore" })) && rollbackComplete;
       if (enabledByAttempt)
-        rollbackComplete = attempt(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
+        rollbackComplete = attempt(() => request.run("systemctl", ["--user", "disable", request.timerUnit], { stdio: "ignore" })) && rollbackComplete;
       rollbackComplete = attempt(() => restoreFile(serviceSnapshot, fileSystem)) && rollbackComplete;
       rollbackComplete = attempt(() => restoreFile(timerSnapshot, fileSystem)) && rollbackComplete;
       if (legacyServiceSnapshot)
         rollbackComplete = attempt(() => restoreFile(legacyServiceSnapshot, fileSystem)) && rollbackComplete;
       if (legacyTimerSnapshot)
         rollbackComplete = attempt(() => restoreFile(legacyTimerSnapshot, fileSystem)) && rollbackComplete;
-      rollbackComplete = attempt(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" })) && rollbackComplete;
+      rollbackComplete = attempt(() => request.run("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" })) && rollbackComplete;
       rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState)) && rollbackComplete;
       if (wasActive)
-        rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
+        rollbackComplete = attempt(() => request.run("systemctl", ["--user", "start", request.timerUnit], { stdio: "ignore" })) && rollbackComplete;
       if (legacyUnitFileState)
         rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.legacyTimerUnit, legacyUnitFileState)) && rollbackComplete;
       if (legacyWasActive)
-        rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.legacyTimerUnit}`, { stdio: "ignore" })) && rollbackComplete;
+        rollbackComplete = attempt(() => request.run("systemctl", ["--user", "start", request.legacyTimerUnit], { stdio: "ignore" })) && rollbackComplete;
       const cleanPriorState = serviceSnapshot.type === "missing" && timerSnapshot.type === "missing" && !wasActive && !legacyRelevant && (unitFileState === "disabled" || unitFileState === "not-found");
       const detail = error45 instanceof Error ? error45.message : String(error45);
       if (cleanPriorState && rollbackComplete) {
@@ -12905,6 +12919,14 @@ function ensureDir(dir) {
 }
 function slugify(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+var SAFE_JOB_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/;
+function validateJobIdentifiers(job) {
+  const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
+  if (!SAFE_JOB_IDENTIFIER.test(scopeId))
+    throw new Error(`Invalid job scopeId: ${JSON.stringify(scopeId)}`);
+  if (!SAFE_JOB_IDENTIFIER.test(job.slug))
+    throw new Error(`Invalid job slug: ${JSON.stringify(job.slug)}`);
 }
 function normalizeWorkdirPath(input) {
   const trimmed = input.trim();
@@ -13637,6 +13659,7 @@ ${calendarXml}
 </plist>`;
 }
 function installLaunchdJob(job) {
+  validateJobIdentifiers(job);
   ensureDir(LAUNCH_AGENTS_DIR);
   ensureDir(LOGS_DIR);
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
@@ -13647,18 +13670,19 @@ function installLaunchdJob(job) {
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
   const plistPath = join2(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
-    execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" });
+    execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" });
   } catch {}
   if (existsSync2(legacyPlistPath)) {
     try {
-      execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" });
+      execFileSync("launchctl", ["unload", legacyPlistPath], { stdio: "ignore" });
     } catch {}
   }
   const plist = createLaunchdPlist(job);
   writeFileSync2(plistPath, plist);
-  execSync(`launchctl load "${plistPath}"`);
+  execFileSync("launchctl", ["load", plistPath]);
 }
 function uninstallLaunchdJob(job) {
+  validateJobIdentifiers(job);
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
   const scopedPlistPath = join2(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
@@ -13668,7 +13692,7 @@ function uninstallLaunchdJob(job) {
     if (!existsSync2(plistPath))
       continue;
     try {
-      execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" });
+      execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" });
     } catch {}
     try {
       unlinkSync2(plistPath);
@@ -13683,11 +13707,11 @@ function systemdRunEnv() {
     PATH: existingPath ? `${enhancedPath}:${existingPath}` : enhancedPath
   });
 }
-function defaultSystemdCommandRunner(command, options) {
-  return execSync(command, { ...options, env: systemdRunEnv() });
+function defaultSystemdCommandRunner(executable, args, options) {
+  return execFileSync(executable, [...args], { ...options, env: systemdRunEnv() });
 }
-function systemdExecSync(command, options) {
-  return defaultSystemdCommandRunner(command, options);
+function systemdExecSync(args, options) {
+  return defaultSystemdCommandRunner("systemctl", args, options);
 }
 function createSystemdService(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
@@ -13727,6 +13751,7 @@ WantedBy=timers.target
 `;
 }
 function installSystemdJob(job, run = defaultSystemdCommandRunner) {
+  validateJobIdentifiers(job);
   ensureDir(SYSTEMD_USER_DIR);
   ensureDir(LOGS_DIR);
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
@@ -13736,8 +13761,6 @@ function installSystemdJob(job, run = defaultSystemdCommandRunner) {
   const timerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
   const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1);
   const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1);
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(job.slug))
-    throw new Error(`Invalid job slug for systemd unit: ${job.slug}`);
   installSystemdUnits({
     unitDir: SYSTEMD_USER_DIR,
     lockDir: join2(SCHEDULER_DIR, "systemd-install-locks"),
@@ -13756,13 +13779,14 @@ function installSystemdJob(job, run = defaultSystemdCommandRunner) {
   });
 }
 function uninstallSystemdJob(job) {
+  validateJobIdentifiers(job);
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   const scopedTimerUnit = `opencode-job-${scopeId}-${job.slug}.timer`;
   const legacyTimerUnit = `opencode-job-${job.slug}.timer`;
   for (const timerUnit of [scopedTimerUnit, legacyTimerUnit]) {
     try {
-      systemdExecSync(`systemctl --user stop ${timerUnit}`, { stdio: "ignore" });
-      systemdExecSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
+      systemdExecSync(["--user", "stop", timerUnit], { stdio: "ignore" });
+      systemdExecSync(["--user", "disable", timerUnit], { stdio: "ignore" });
     } catch {}
   }
   const scopedServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
@@ -13777,10 +13801,11 @@ function uninstallSystemdJob(job) {
     }
   }
   try {
-    systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" });
+    systemdExecSync(["--user", "daemon-reload"], { stdio: "ignore" });
   } catch {}
 }
 function installWindowsJob(job) {
+  validateJobIdentifiers(job);
   uninstallWindowsJob(job);
   const taskDefinitions = cronToWindowsTaskDefinitions(job);
   for (const task of taskDefinitions) {
@@ -13788,6 +13813,7 @@ function installWindowsJob(job) {
   }
 }
 function uninstallWindowsJob(job) {
+  validateJobIdentifiers(job);
   const candidates = new Set;
   const scopedBase = windowsTaskBaseName(job);
   const legacyBase = `${WINDOWS_TASK_PREFIX}-${job.slug}`;
@@ -13819,7 +13845,7 @@ function isSystemdUserAvailable() {
   if (!isCommandAvailable("systemctl"))
     return false;
   try {
-    systemdExecSync("systemctl --user show-environment", {
+    systemdExecSync(["--user", "show-environment"], {
       stdio: "ignore"
     });
     return true;
@@ -13957,6 +13983,7 @@ function resolveSchedulerBackend() {
   throw new Error(`Unsupported platform: ${platform()}. Supported platforms: macOS (launchd), Linux (systemd or cron), Windows, and POSIX systems with cron.`);
 }
 function installJob(job) {
+  validateJobIdentifiers(job);
   const backend = resolveSchedulerBackend();
   if (backend === "launchd") {
     installLaunchdJob(job);
@@ -13973,6 +14000,7 @@ function installJob(job) {
   return backend;
 }
 function uninstallJob(job) {
+  validateJobIdentifiers(job);
   if (IS_MAC) {
     uninstallLaunchdJob(job);
     return;

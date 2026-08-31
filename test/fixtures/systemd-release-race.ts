@@ -17,7 +17,8 @@ const fileSystem: SystemdFileSystem = {
   },
   stat: fs.statSync, symlink: fs.symlinkSync, unlink: fs.unlinkSync, writeFile: fs.writeFileSync,
 }
-const run: SystemdCommandRunner = (command) => {
+const run: SystemdCommandRunner = (_executable, args) => {
+    const command = args.join(" ")
   if (command.includes("is-enabled")) return Buffer.from("disabled\n")
   if (command.includes("is-active")) return Buffer.from("inactive\n")
   if (command.endsWith("daemon-reload")) appendFileSync(ledger, `transaction:${id}\n`)
