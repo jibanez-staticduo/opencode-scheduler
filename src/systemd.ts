@@ -93,6 +93,9 @@ export interface SystemdInstallRequest {
   timerUnit: string
   serviceContent: string
   timerContent: string
+  lockKey?: string
+  legacyServiceUnit?: string
+  legacyTimerUnit?: string
   run: SystemdCommandRunner
   fileSystem?: SystemdFileSystem
   lock?: Partial<SystemdLockOptions>
@@ -138,6 +141,19 @@ interface SystemdLockOptions {
   isPidAlive: (pid: number) => boolean
   sleep: (milliseconds: number) => void
 }
+
+interface LockMetadata {
+  pid?: number
+  timestamp?: number
+  token?: string
+  phase?: "active" | "completed"
+}
+
+interface LockHandle {
+  release: () => void
+}
+
+const localCompletedLocks = new Map<string, string>()
 
 const sleepArray = new Int32Array(new SharedArrayBuffer(4))
 const defaultLockOptions: SystemdLockOptions = {
@@ -301,7 +317,7 @@ function isErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code
 }
 
-function readLockMetadata(lockPath: string, fileSystem: SystemdFileSystem): { pid?: number; timestamp?: number } {
+function readLockMetadata(lockPath: string, fileSystem: SystemdFileSystem): LockMetadata {
   try {
     const parsed = JSON.parse(fileSystem.readFile(join(lockPath, "owner.json"), "utf8")) as unknown
     if (typeof parsed !== "object" || parsed === null) return {}
@@ -309,10 +325,16 @@ function readLockMetadata(lockPath: string, fileSystem: SystemdFileSystem): { pi
     return {
       pid: typeof record.pid === "number" ? record.pid : undefined,
       timestamp: typeof record.timestamp === "number" ? record.timestamp : undefined,
+      token: typeof record.token === "string" ? record.token : undefined,
+      phase: record.phase === "active" || record.phase === "completed" ? record.phase : undefined,
     }
   } catch {
     return {}
   }
+}
+
+function writeLockMetadata(lockPath: string, metadata: Required<LockMetadata>, fileSystem: SystemdFileSystem): void {
+  atomicReplace(join(lockPath, "owner.json"), JSON.stringify(metadata), 0o600, fileSystem)
 }
 
 function acquireLock(
@@ -320,21 +342,36 @@ function acquireLock(
   timerUnit: string,
   fileSystem: SystemdFileSystem,
   overrides?: Partial<SystemdLockOptions>
-): () => void {
+): LockHandle {
   const options = { ...defaultLockOptions, ...overrides }
   fileSystem.mkdir(lockRoot, { recursive: true })
   const lockPath = join(lockRoot, `${timerUnit}.lock`)
+  const token = `${options.pid}-${options.now()}-${temporaryFileSequence += 1}`
   const startedAt = options.now()
   while (true) {
     try {
       fileSystem.mkdir(lockPath)
       try {
-        fileSystem.writeFile(join(lockPath, "owner.json"), JSON.stringify({ pid: options.pid, timestamp: options.now() }))
+        writeLockMetadata(lockPath, { pid: options.pid, timestamp: options.now(), token, phase: "active" }, fileSystem)
       } catch (error) {
         bestEffort(() => fileSystem.rm(lockPath, { recursive: true, force: true }))
         throw error
       }
-      return () => fileSystem.rm(lockPath, { recursive: true, force: true })
+      return {
+        release() {
+          localCompletedLocks.set(lockPath, token)
+          try {
+            writeLockMetadata(lockPath, { pid: options.pid, timestamp: options.now(), token, phase: "completed" }, fileSystem)
+          } finally {
+            try {
+              fileSystem.rm(lockPath, { recursive: true, force: true })
+              localCompletedLocks.delete(lockPath)
+            } catch (error) {
+              throw error
+            }
+          }
+        },
+      }
     } catch (error) {
       if (!isErrorCode(error, "EEXIST")) throw error
       let lockStats: ReturnType<typeof lstatSync>
@@ -354,7 +391,8 @@ function acquireLock(
       const timestamp = metadata.timestamp ?? lockStats.mtimeMs
       const oldEnough = options.now() - timestamp >= options.staleAfterMs
       const ownerAlive = metadata.pid !== undefined && options.isPidAlive(metadata.pid)
-      if (oldEnough && !ownerAlive) {
+      const locallyCompleted = metadata.token !== undefined && localCompletedLocks.get(lockPath) === metadata.token
+      if (metadata.phase === "completed" || locallyCompleted || (oldEnough && !ownerAlive)) {
         const quarantinePath = join(lockRoot, `${timerUnit}.stale-${options.pid}-${options.now()}-${temporaryFileSequence += 1}`)
         try {
           fileSystem.rename(lockPath, quarantinePath)
@@ -363,6 +401,7 @@ function acquireLock(
           throw claimError
         }
         fileSystem.rm(quarantinePath, { recursive: true, force: true })
+        if (metadata.token) localCompletedLocks.delete(lockPath)
         continue
       }
       if (options.now() - startedAt >= options.timeoutMs) {
@@ -375,11 +414,11 @@ function acquireLock(
 
 export function installSystemdUnits(request: SystemdInstallRequest): void {
   const fileSystem = request.fileSystem ?? defaultFileSystem
-  let releaseLock: () => void
+  let lockHandle: LockHandle
   try {
-    releaseLock = acquireLock(
+    lockHandle = acquireLock(
       request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"),
-      request.timerUnit,
+      request.lockKey ?? request.timerUnit,
       fileSystem,
       request.lock
     )
@@ -399,9 +438,23 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
     const timerSnapshot = snapshotFile(timerPath, fileSystem)
     const unitFileState = queryUnitFileState(request.run, request.timerUnit)
     const wasActive = queryActiveState(request.run, request.timerUnit)
+    const legacyServicePath = request.legacyServiceUnit ? join(request.unitDir, request.legacyServiceUnit) : undefined
+    const legacyTimerPath = request.legacyTimerUnit ? join(request.unitDir, request.legacyTimerUnit) : undefined
+    const legacyServiceSnapshot = legacyServicePath ? snapshotFile(legacyServicePath, fileSystem) : undefined
+    const legacyTimerSnapshot = legacyTimerPath ? snapshotFile(legacyTimerPath, fileSystem) : undefined
+    const legacyRelevant = Boolean(
+      request.legacyTimerUnit &&
+      (legacyServiceSnapshot?.type !== "missing" || legacyTimerSnapshot?.type !== "missing")
+    )
+    const legacyUnitFileState = legacyRelevant ? queryUnitFileState(request.run, request.legacyTimerUnit!) : undefined
+    const legacyWasActive = legacyRelevant ? queryActiveState(request.run, request.legacyTimerUnit!) : false
 
     let enabledByAttempt = false
     try {
+      if (legacyRelevant) {
+        request.run(`systemctl --user stop ${request.legacyTimerUnit}`)
+        request.run(`systemctl --user disable ${request.legacyTimerUnit}`)
+      }
       atomicReplace(servicePath, request.serviceContent, 0o644, fileSystem)
       atomicReplace(timerPath, request.timerContent, 0o644, fileSystem)
       request.run("systemctl --user daemon-reload")
@@ -414,14 +467,19 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
       if (enabledByAttempt) rollbackComplete = attempt(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
       rollbackComplete = attempt(() => restoreFile(serviceSnapshot, fileSystem)) && rollbackComplete
       rollbackComplete = attempt(() => restoreFile(timerSnapshot, fileSystem)) && rollbackComplete
+      if (legacyServiceSnapshot) rollbackComplete = attempt(() => restoreFile(legacyServiceSnapshot, fileSystem)) && rollbackComplete
+      if (legacyTimerSnapshot) rollbackComplete = attempt(() => restoreFile(legacyTimerSnapshot, fileSystem)) && rollbackComplete
       rollbackComplete = attempt(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" })) && rollbackComplete
       rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState)) && rollbackComplete
       if (wasActive) rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
+      if (legacyUnitFileState) rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.legacyTimerUnit!, legacyUnitFileState)) && rollbackComplete
+      if (legacyWasActive) rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.legacyTimerUnit}`, { stdio: "ignore" })) && rollbackComplete
 
       const cleanPriorState =
         serviceSnapshot.type === "missing" &&
         timerSnapshot.type === "missing" &&
         !wasActive &&
+        !legacyRelevant &&
         (unitFileState === "disabled" || unitFileState === "not-found")
       const detail = error instanceof Error ? error.message : String(error)
       if (cleanPriorState && rollbackComplete) {
@@ -436,10 +494,10 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
     primaryError = error
     throw error
   } finally {
-    if (primaryError) bestEffort(releaseLock)
+    if (primaryError) bestEffort(lockHandle.release)
     else {
       try {
-        releaseLock()
+        lockHandle.release()
       } catch (error) {
         request.onWarning?.(
           `Systemd schedule ${request.timerUnit} is installed, but its install lock could not be removed; cron fallback was not installed.`,

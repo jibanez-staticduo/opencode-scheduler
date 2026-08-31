@@ -1119,11 +1119,15 @@ function installSystemdJob(job: Job, run: SystemdCommandRunner = defaultSystemdC
 
   const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1)
   const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1)
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(job.slug)) throw new Error(`Invalid job slug for systemd unit: ${job.slug}`)
   installSystemdUnits({
     unitDir: SYSTEMD_USER_DIR,
     lockDir: join(SCHEDULER_DIR, "systemd-install-locks"),
     serviceUnit,
     timerUnit,
+    lockKey: `opencode-job-${job.slug}`,
+    legacyServiceUnit: `opencode-job-${job.slug}.service`,
+    legacyTimerUnit: `opencode-job-${job.slug}.timer`,
     serviceContent: createSystemdService(job),
     timerContent: createSystemdTimer(job),
     run,
