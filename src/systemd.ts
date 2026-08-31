@@ -13,9 +13,23 @@ import {
   writeFileSync,
 } from "fs"
 import { join } from "path"
-import type { ExecSyncOptions } from "child_process"
+import type { ExecFileSyncOptions } from "child_process"
 
-export type SystemdCommandRunner = (command: string, options?: ExecSyncOptions) => Buffer | string
+export type SystemdCommandRunner = (executable: "systemctl", args: readonly string[], options?: ExecFileSyncOptions) => Buffer | string
+
+const SAFE_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/
+const SAFE_UNIT = /^[a-z0-9][a-z0-9-]{0,127}\.(service|timer)$/
+
+function validateInstallRequest(request: SystemdInstallRequest): void {
+  const invalid = (label: string, value: string | undefined, pattern: RegExp) => {
+    if (value !== undefined && !pattern.test(value)) throw new Error(`Invalid ${label}: ${JSON.stringify(value)}`)
+  }
+  invalid("service unit", request.serviceUnit, SAFE_UNIT)
+  invalid("timer unit", request.timerUnit, SAFE_UNIT)
+  invalid("legacy service unit", request.legacyServiceUnit, SAFE_UNIT)
+  invalid("legacy timer unit", request.legacyTimerUnit, SAFE_UNIT)
+  invalid("lock key", request.lockKey, SAFE_IDENTIFIER)
+}
 
 export class SystemdNonFallbackError extends Error {
   readonly fallbackSafe = false
@@ -249,7 +263,7 @@ function commandOutput(value: unknown): string {
 function queryUnitFileState(run: SystemdCommandRunner, timerUnit: string): UnitFileState {
   let output = ""
   try {
-    output = commandOutput(run(`systemctl --user is-enabled ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }))
+    output = commandOutput(run("systemctl", ["--user", "is-enabled", timerUnit], { stdio: ["ignore", "pipe", "ignore"] }))
   } catch (error) {
     output = commandOutput(error)
   }
@@ -268,7 +282,7 @@ function queryUnitFileState(run: SystemdCommandRunner, timerUnit: string): UnitF
 function queryActiveState(run: SystemdCommandRunner, timerUnit: string): boolean {
   let output = ""
   try {
-    output = commandOutput(run(`systemctl --user is-active ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }))
+    output = commandOutput(run("systemctl", ["--user", "is-active", timerUnit], { stdio: ["ignore", "pipe", "ignore"] }))
   } catch (error) {
     output = commandOutput(error)
   }
@@ -303,9 +317,9 @@ function attempt(action: () => void): boolean {
 }
 
 function restoreUnitFileState(run: SystemdCommandRunner, timerUnit: string, state: UnitFileState): void {
-  if (state === "enabled") run(`systemctl --user enable ${timerUnit}`, { stdio: "ignore" })
-  if (state === "enabled-runtime") run(`systemctl --user enable --runtime ${timerUnit}`, { stdio: "ignore" })
-  if (state === "disabled") run(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" })
+  if (state === "enabled") run("systemctl", ["--user", "enable", timerUnit], { stdio: "ignore" })
+  if (state === "enabled-runtime") run("systemctl", ["--user", "enable", "--runtime", timerUnit], { stdio: "ignore" })
+  if (state === "disabled") run("systemctl", ["--user", "disable", timerUnit], { stdio: "ignore" })
   // linked, masked, static, indirect, alias and not-found are represented by
   // the restored filesystem node or by immutable unit metadata. Running
   // enable/disable here would change their exact prior state.
@@ -423,6 +437,7 @@ function acquireLock(
 }
 
 export function installSystemdUnits(request: SystemdInstallRequest): void {
+  validateInstallRequest(request)
   const fileSystem = request.fileSystem ?? defaultFileSystem
   let lockHandle: LockHandle
   try {
@@ -462,8 +477,8 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
     let enabledByAttempt = false
     try {
       if (legacyRelevant) {
-        request.run(`systemctl --user stop ${request.legacyTimerUnit}`)
-        request.run(`systemctl --user disable ${request.legacyTimerUnit}`)
+        request.run("systemctl", ["--user", "stop", request.legacyTimerUnit!])
+        request.run("systemctl", ["--user", "disable", request.legacyTimerUnit!])
         // disable may unlink linked/alias unit nodes; preserve the exact legacy
         // files while leaving the timer stopped and absent from target wants.
         if (legacyServiceSnapshot) restoreFile(legacyServiceSnapshot, fileSystem)
@@ -471,24 +486,24 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
       }
       atomicReplace(servicePath, request.serviceContent, 0o644, fileSystem)
       atomicReplace(timerPath, request.timerContent, 0o644, fileSystem)
-      request.run("systemctl --user daemon-reload")
-      if (legacyRelevant) request.run(`systemctl --user stop ${request.legacyTimerUnit}`)
-      request.run(`systemctl --user enable ${request.timerUnit}`)
+      request.run("systemctl", ["--user", "daemon-reload"])
+      if (legacyRelevant) request.run("systemctl", ["--user", "stop", request.legacyTimerUnit!])
+      request.run("systemctl", ["--user", "enable", request.timerUnit])
       enabledByAttempt = true
-      request.run(`systemctl --user start ${request.timerUnit}`)
+      request.run("systemctl", ["--user", "start", request.timerUnit])
     } catch (error) {
       let rollbackComplete = true
-      if (!wasActive) rollbackComplete = attempt(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
-      if (enabledByAttempt) rollbackComplete = attempt(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
+      if (!wasActive) rollbackComplete = attempt(() => request.run("systemctl", ["--user", "stop", request.timerUnit], { stdio: "ignore" })) && rollbackComplete
+      if (enabledByAttempt) rollbackComplete = attempt(() => request.run("systemctl", ["--user", "disable", request.timerUnit], { stdio: "ignore" })) && rollbackComplete
       rollbackComplete = attempt(() => restoreFile(serviceSnapshot, fileSystem)) && rollbackComplete
       rollbackComplete = attempt(() => restoreFile(timerSnapshot, fileSystem)) && rollbackComplete
       if (legacyServiceSnapshot) rollbackComplete = attempt(() => restoreFile(legacyServiceSnapshot, fileSystem)) && rollbackComplete
       if (legacyTimerSnapshot) rollbackComplete = attempt(() => restoreFile(legacyTimerSnapshot, fileSystem)) && rollbackComplete
-      rollbackComplete = attempt(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" })) && rollbackComplete
+      rollbackComplete = attempt(() => request.run("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" })) && rollbackComplete
       rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState)) && rollbackComplete
-      if (wasActive) rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
+      if (wasActive) rollbackComplete = attempt(() => request.run("systemctl", ["--user", "start", request.timerUnit], { stdio: "ignore" })) && rollbackComplete
       if (legacyUnitFileState) rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.legacyTimerUnit!, legacyUnitFileState)) && rollbackComplete
-      if (legacyWasActive) rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.legacyTimerUnit}`, { stdio: "ignore" })) && rollbackComplete
+      if (legacyWasActive) rollbackComplete = attempt(() => request.run("systemctl", ["--user", "start", request.legacyTimerUnit!], { stdio: "ignore" })) && rollbackComplete
 
       const cleanPriorState =
         serviceSnapshot.type === "missing" &&

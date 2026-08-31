@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "fs";
-import type { ExecSyncOptions } from "child_process";
-export type SystemdCommandRunner = (command: string, options?: ExecSyncOptions) => Buffer | string;
+import type { ExecFileSyncOptions } from "child_process";
+export type SystemdCommandRunner = (executable: "systemctl", args: readonly string[], options?: ExecFileSyncOptions) => Buffer | string;
 export declare class SystemdNonFallbackError extends Error {
     readonly fallbackSafe = false;
     readonly originalError: unknown;
