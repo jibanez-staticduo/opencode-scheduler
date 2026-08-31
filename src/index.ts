@@ -16,11 +16,13 @@ import { tool } from "@opencode-ai/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
-import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
+import { execFileSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
 import { cronToSystemdCalendars, parseCronField, splitCronExpression, validateCronExpression } from "./cron"
 import { installSystemdUnits, type SystemdCommandRunner, withSystemdRuntimeEnv } from "./systemd"
 import { installLinuxScheduler } from "./backend"
+import { readExecutableVersion } from "./process"
+import { deriveSafeScopeId, isSafeIdentifier, NAME_MAX_BYTES } from "./identifiers"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -65,12 +67,25 @@ function slugify(name: string): string {
     .replace(/^-|-$/g, "")
 }
 
-const SAFE_JOB_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8")
+}
+
+function validateSafeIdentifier(label: string, value: string): void {
+  if (!isSafeIdentifier(value)) throw new Error(`Invalid job ${label}: ${JSON.stringify(value)}`)
+}
 
 function validateJobIdentifiers(job: Job): void {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
-  if (!SAFE_JOB_IDENTIFIER.test(scopeId)) throw new Error(`Invalid job scopeId: ${JSON.stringify(scopeId)}`)
-  if (!SAFE_JOB_IDENTIFIER.test(job.slug)) throw new Error(`Invalid job slug: ${JSON.stringify(job.slug)}`)
+  validateSafeIdentifier("scopeId", scopeId)
+  validateSafeIdentifier("slug", job.slug)
+  const names = [
+    `opencode-job-${scopeId}-${job.slug}.service`, `opencode-job-${scopeId}-${job.slug}.timer`,
+    `opencode-job-${job.slug}.service`, `opencode-job-${job.slug}.timer`,
+  ]
+  if (names.some((name) => byteLength(name) > NAME_MAX_BYTES)) {
+    throw new Error("Job scopeId/slug exceeds the platform unit filename limit")
+  }
 }
 
 function normalizeWorkdirPath(input: string): string {
@@ -79,28 +94,8 @@ function normalizeWorkdirPath(input: string): string {
   return resolvePath(trimmed)
 }
 
-function fnv1a64(input: string): bigint {
-  // 64-bit FNV-1a
-  let hash = 0xcbf29ce484222325n
-  const prime = 0x100000001b3n
-  const data = Buffer.from(input, "utf8")
-  for (const byte of data) {
-    hash ^= BigInt(byte)
-    hash = (hash * prime) & 0xffffffffffffffffn
-  }
-  return hash
-}
-
-function fnv1a64Hex(input: string): string {
-  return fnv1a64(input).toString(16).padStart(16, "0")
-}
-
 function deriveScopeId(workdir: string): string {
-  const normalized = normalizeWorkdirPath(workdir)
-  const base = slugify(basename(normalized)) || "workspace"
-  // 48 bits of hash is enough here; keep label/unit names short.
-  const suffix = fnv1a64Hex(normalized).slice(0, 12)
-  return `${base}-${suffix}`
+  return deriveSafeScopeId(normalizeWorkdirPath(workdir))
 }
 
 function scopeDir(scopeId: string): string {
@@ -637,19 +632,11 @@ function findOpencode(): string {
   // Prefer PATH resolution so the scheduler uses the same `opencode` as the user.
   // This fixes cases where an old install exists at ~/.opencode/bin/opencode.
   try {
-    const resolved = execSync("command -v opencode", {
+    execFileSync("opencode", ["--version"], {
       env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: "ignore",
     })
-      .toString()
-      .trim()
-
-    if (resolved) {
-      // If command -v returns a path, prefer it.
-      if (resolved.includes("/")) return resolved
-      // Fallback: let the OS resolve via PATH at runtime.
-      return "opencode"
-    }
+    return "opencode"
   } catch {
     // ignore
   }
@@ -1218,8 +1205,9 @@ function uninstallWindowsJob(job: Job): void {
 type SchedulerBackend = "launchd" | "systemd" | "schtasks" | "cron"
 
 function isCommandAvailable(command: string): boolean {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(command)) return false
   try {
-    execSync(`command -v ${command}`, {
+    execFileSync(command, ["--version"], {
       stdio: "ignore",
       env: buildRunEnvironment(),
     })
@@ -2214,14 +2202,7 @@ function loadSchedulerConfig(): SchedulerConfig {
 }
 
 function getOpencodeVersion(opencodePath: string): string | null {
-  try {
-    const output = execSync(`"${opencodePath}" --version`, { env: buildRunEnvironment() })
-      .toString()
-      .trim()
-    return output || null
-  } catch {
-    return null
-  }
+  return readExecutableVersion(opencodePath, buildRunEnvironment())
 }
 
 function runJobNow(job: Job): { startedAt: string; logPath: string; pid?: number; job: Job | null } {

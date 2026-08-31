@@ -20,6 +20,8 @@ import { join } from "path"
 import { spawn, spawnSync } from "child_process"
 import { cronToSystemdCalendars } from "../src/cron"
 import { installLinuxScheduler, installSystemdWithCronFallback } from "../src/backend"
+import { readExecutableVersion } from "../src/process"
+import { deriveSafeScopeId } from "../src/identifiers"
 import {
   installSystemdUnits,
   SystemdFallbackSafeError,
@@ -91,6 +93,47 @@ describe("withSystemdRuntimeEnv", () => {
     const env = withSystemdRuntimeEnv({}, { uid: () => 42, exists: (path) => path === "/run/user/42" })
     expect(env.XDG_RUNTIME_DIR).toBe("/run/user/42")
     expect(env.DBUS_SESSION_BUS_ADDRESS).toBeUndefined()
+  })
+})
+
+describe("safe executable version probing", () => {
+  for (const executable of ['bad";touch /tmp/pwn', "$(touch /tmp/pwn)", "bad\ncommand"] as const) {
+    test(`passes override literally without a shell: ${JSON.stringify(executable)}`, () => {
+      const calls: Array<{ file: string; args: readonly string[] }> = []
+      const version = readExecutableVersion(executable, {}, (file, args) => {
+        calls.push({ file, args })
+        const error = new Error("ENOENT") as NodeJS.ErrnoException
+        error.code = "ENOENT"
+        throw error
+      })
+      expect(version).toBeNull()
+      expect(calls).toEqual([{ file: executable, args: ["--version"] }])
+    })
+  }
+})
+
+describe("identifier length compatibility", () => {
+  test("truncates long generated workspace scope while retaining hash", () => {
+    const scope = deriveSafeScopeId(`/tmp/${"workspace".repeat(80)}`)
+    expect(Buffer.byteLength(scope)).toBeLessThanOrEqual(96)
+    expect(scope).toMatch(/-[0-9a-f]{12}$/)
+  })
+
+  test("accepts historically safe long persisted slug when final unit fits NAME_MAX", () => {
+    const root = sandbox()
+    const slug = "a".repeat(220)
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    installSystemdUnits({ unitDir: root, serviceUnit: `${slug}.service`, timerUnit: `${slug}.timer`, lockKey: slug, serviceContent: "new", timerContent: "new", run: fakeRunner(state) })
+    expect(existsSync(join(root, `${slug}.timer`))).toBe(true)
+  })
+
+  test("rejects over-limit safe unit before mutation", () => {
+    const root = sandbox()
+    const slug = "a".repeat(250)
+    let calls = 0
+    expect(() => installSystemdUnits({ unitDir: root, serviceUnit: `${slug}.service`, timerUnit: `${slug}.timer`, lockKey: slug, serviceContent: "new", timerContent: "new", run: () => { calls += 1; return Buffer.alloc(0) } })).toThrow("Invalid")
+    expect(calls).toBe(0)
+    expect(existsSync(join(root, ".opencode-scheduler-locks"))).toBe(false)
   })
 })
 

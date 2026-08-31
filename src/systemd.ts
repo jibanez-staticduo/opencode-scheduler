@@ -17,12 +17,15 @@ import type { ExecFileSyncOptions } from "child_process"
 
 export type SystemdCommandRunner = (executable: "systemctl", args: readonly string[], options?: ExecFileSyncOptions) => Buffer | string
 
-const SAFE_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/
-const SAFE_UNIT = /^[a-z0-9][a-z0-9-]{0,127}\.(service|timer)$/
+const SAFE_IDENTIFIER = /^[a-z0-9][a-z0-9-]*$/
+const SAFE_UNIT = /^[a-z0-9][a-z0-9-]*\.(service|timer)$/
+const NAME_MAX_BYTES = 255
 
 function validateInstallRequest(request: SystemdInstallRequest): void {
   const invalid = (label: string, value: string | undefined, pattern: RegExp) => {
-    if (value !== undefined && !pattern.test(value)) throw new Error(`Invalid ${label}: ${JSON.stringify(value)}`)
+    if (value !== undefined && (!pattern.test(value) || Buffer.byteLength(value, "utf8") > NAME_MAX_BYTES)) {
+      throw new Error(`Invalid ${label}: ${JSON.stringify(value)}`)
+    }
   }
   invalid("service unit", request.serviceUnit, SAFE_UNIT)
   invalid("timer unit", request.timerUnit, SAFE_UNIT)
