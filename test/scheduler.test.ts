@@ -254,7 +254,7 @@ describe("installSystemdUnits transaction", () => {
     expect(states.get("job.timer")).toEqual({ enabled: "enabled", active: true })
     expect(readFileSync(legacyService, "utf8")).toBe("legacy service")
     expect(readFileSync(legacyTimer, "utf8")).toBe("legacy timer")
-    expect(calls.filter((call) => call.includes("legacy.timer") && call.includes(" stop "))).toHaveLength(1)
+    expect(calls.filter((call) => call.includes("legacy.timer") && call.includes(" stop "))).toHaveLength(2)
   })
 
   for (const failure of ["first-write", "second-write", "second-chmod", "daemon-reload", "enable", "start"] as FailurePoint[]) {
@@ -325,6 +325,40 @@ describe("installSystemdUnits transaction", () => {
     })
     expect(state.calls.some((call) => call.includes("legacy.timer"))).toBe(false)
   })
+
+  for (const legacyState of ["linked", "linked-runtime"] as const) {
+    test(`successful migration restores exact ${legacyState} symlink after disable unlinks it`, () => {
+      const root = sandbox()
+      const target = legacyState === "linked" ? "../external/legacy.timer" : "/run/user/1000/systemd/legacy.timer"
+      const legacyTimer = join(root, "legacy.timer")
+      symlinkSync(target, legacyTimer)
+      const calls: string[] = []
+      let legacyActive = true
+      let scopedActive = false
+      const run: SystemdCommandRunner = (command) => {
+        calls.push(command)
+        if (command.includes("is-enabled legacy.timer")) return Buffer.from(`${legacyState}\n`)
+        if (command.includes("is-active legacy.timer")) return Buffer.from(legacyActive ? "active\n" : "inactive\n")
+        if (command.includes("is-enabled job.timer")) return Buffer.from("disabled\n")
+        if (command.includes("is-active job.timer")) return Buffer.from(scopedActive ? "active\n" : "inactive\n")
+        if (command.includes("stop legacy.timer")) legacyActive = false
+        if (command.includes("disable legacy.timer")) unlinkSync(legacyTimer)
+        if (command.includes("start job.timer")) scopedActive = true
+        return Buffer.alloc(0)
+      }
+      installSystemdUnits({
+        unitDir: root, lockKey: "shared", serviceUnit: "job.service", timerUnit: "job.timer",
+        legacyServiceUnit: "legacy.service", legacyTimerUnit: "legacy.timer",
+        serviceContent: "new", timerContent: "new", run,
+      })
+      expect(lstatSync(legacyTimer).isSymbolicLink()).toBe(true)
+      expect(readlinkSync(legacyTimer)).toBe(target)
+      expect(legacyActive).toBe(false)
+      expect(scopedActive).toBe(true)
+      expect(calls.some((call) => call.includes("enable legacy.timer"))).toBe(false)
+      expect(calls.filter((call) => call.includes("stop legacy.timer"))).toHaveLength(2)
+    })
+  }
 
   for (const target of ["/dev/null", "../units/original.timer"] as const) {
     for (const failure of ["first-write", "second-write", "second-chmod", "daemon-reload", "enable", "start"] as FailurePoint[]) {
@@ -468,7 +502,7 @@ describe("installSystemdUnits transaction", () => {
     }
     const originalRm = fileSystem.rm
     fileSystem.rm = (path, options) => {
-      if (String(path).endsWith("job.timer.lock")) throw new Error("LOCK_RELEASE")
+      if (String(path).includes("job.timer.release-")) throw new Error("LOCK_RELEASE")
       return originalRm(path, options)
     }
     const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
@@ -483,7 +517,7 @@ describe("installSystemdUnits transaction", () => {
     const fileSystem: SystemdFileSystem = {
       chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
       readlink: readlinkSync, rename: renameSync, rm: (path, options) => {
-        if (String(path).endsWith("job.timer.lock")) throw new Error("LOCK_RELEASE")
+        if (String(path).includes("job.timer.release-")) throw new Error("LOCK_RELEASE")
         return rmSync(path, options)
       }, stat: statSync, symlink: symlinkSync, unlink: unlinkSync, writeFile: writeFileSync,
     }
@@ -506,13 +540,13 @@ describe("installSystemdUnits transaction", () => {
     const fileSystem: SystemdFileSystem = {
       chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
       readlink: readlinkSync, rename: renameSync, rm: (path, options) => {
-        if (failRelease && String(path).endsWith("shared.lock")) throw new Error("LOCK_RELEASE")
+        if (failRelease && String(path).includes("shared.release-")) throw new Error("LOCK_RELEASE")
         return rmSync(path, options)
       }, stat: statSync, symlink: symlinkSync, unlink: unlinkSync, writeFile: writeFileSync,
     }
     const first: FakeState = { unitFileState: "disabled", active: false, calls: [] }
     installSystemdUnits({ unitDir: root, lockDir: lockRoot, lockKey: "shared", serviceUnit: "one.service", timerUnit: "one.timer", serviceContent: "one", timerContent: "one", run: fakeRunner(first), fileSystem })
-    expect(existsSync(join(lockRoot, "shared.lock"))).toBe(true)
+    expect(existsSync(lockRoot)).toBe(true)
     failRelease = false
     const second: FakeState = { unitFileState: "disabled", active: false, calls: [] }
     installSystemdUnits({ unitDir: root, lockDir: lockRoot, lockKey: "shared", serviceUnit: "two.service", timerUnit: "two.timer", serviceContent: "two", timerContent: "two", run: fakeRunner(second), fileSystem, lock: { timeoutMs: 50, pollMs: 1 } })
@@ -624,6 +658,19 @@ describe("installSystemdUnits transaction", () => {
     expect(active).toBe(0)
     expect(events).toHaveLength(6)
   })
+
+  test("cross-process release quarantine cannot delete a fresh active lock", async () => {
+    const root = sandbox()
+    const ledger = join(root, "release-ledger")
+    const fixture = join(import.meta.dir, "fixtures", "systemd-release-race.ts")
+    const first = spawn("bun", [fixture, root, ledger, "a", "0"], { stdio: "ignore" })
+    const second = spawn("bun", [fixture, root, ledger, "b", "30"], { stdio: "ignore" })
+    const exits = await Promise.all([first, second].map((child) => new Promise<number | null>((resolve) => child.once("exit", resolve))))
+    expect(exits).toEqual([0, 0])
+    const events = readFileSync(ledger, "utf8").trim().split("\n")
+    expect(events).toEqual(["transaction:a", "transaction:b"])
+    expect(readFileSync(join(root, "b.timer"), "utf8")).toBe("b")
+  })
 })
 
 describe("systemd backend fallback integration", () => {
@@ -634,7 +681,7 @@ describe("systemd backend fallback integration", () => {
     const fileSystem: SystemdFileSystem = {
       chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
       readlink: readlinkSync, rename: renameSync, rm: (path, options) => {
-        if (String(path).endsWith("job.timer.lock")) throw new Error("LOCK_RELEASE")
+        if (String(path).includes("job.timer.release-")) throw new Error("LOCK_RELEASE")
         return rmSync(path, options)
       }, stat: statSync, symlink: symlinkSync, unlink: unlinkSync, writeFile: writeFileSync,
     }

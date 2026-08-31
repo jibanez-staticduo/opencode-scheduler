@@ -12502,7 +12502,6 @@ var defaultFileSystem = {
   unlink: unlinkSync,
   writeFile: writeFileSync
 };
-var localCompletedLocks = new Map;
 var sleepArray = new Int32Array(new SharedArrayBuffer(4));
 var defaultLockOptions = {
   timeoutMs: 1e4,
@@ -12709,17 +12708,26 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
       }
       return {
         release() {
-          localCompletedLocks.set(lockPath, token);
-          try {
-            writeLockMetadata(lockPath, { pid: options.pid, timestamp: options.now(), token, phase: "completed" }, fileSystem);
-          } finally {
-            try {
-              fileSystem.rm(lockPath, { recursive: true, force: true });
-              localCompletedLocks.delete(lockPath);
-            } catch (error45) {
-              throw error45;
-            }
+          const observed = readLockMetadata(lockPath, fileSystem);
+          if (observed.token !== token || observed.phase !== "active") {
+            throw new Error(`Refusing to release systemd lock whose ownership changed: ${lockPath}`);
           }
+          const observedStats = fileSystem.lstat(lockPath);
+          const quarantinePath = join(lockRoot, `${timerUnit}.release-${token}`);
+          fileSystem.rename(lockPath, quarantinePath);
+          const claimedStats = fileSystem.lstat(quarantinePath);
+          const claimed = readLockMetadata(quarantinePath, fileSystem);
+          if (claimed.token !== token || claimed.phase !== "active" || claimedStats.dev !== observedStats.dev || claimedStats.ino !== observedStats.ino) {
+            try {
+              fileSystem.rename(quarantinePath, lockPath);
+            } catch (restoreError) {
+              if (!isErrorCode(restoreError, "EEXIST"))
+                throw restoreError;
+            }
+            throw new Error(`Systemd lock changed during release claim: ${lockPath}`);
+          }
+          writeLockMetadata(quarantinePath, { pid: options.pid, timestamp: options.now(), token, phase: "completed" }, fileSystem);
+          fileSystem.rm(quarantinePath, { recursive: true, force: true });
         }
       };
     } catch (error45) {
@@ -12743,8 +12751,7 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
       const timestamp = metadata.timestamp ?? lockStats.mtimeMs;
       const oldEnough = options.now() - timestamp >= options.staleAfterMs;
       const ownerAlive = metadata.pid !== undefined && options.isPidAlive(metadata.pid);
-      const locallyCompleted = metadata.token !== undefined && localCompletedLocks.get(lockPath) === metadata.token;
-      if (metadata.phase === "completed" || locallyCompleted || oldEnough && !ownerAlive) {
+      if (metadata.phase === "completed" || oldEnough && !ownerAlive) {
         const quarantinePath = join(lockRoot, `${timerUnit}.stale-${options.pid}-${options.now()}-${temporaryFileSequence += 1}`);
         try {
           fileSystem.rename(lockPath, quarantinePath);
@@ -12754,8 +12761,6 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
           throw claimError;
         }
         fileSystem.rm(quarantinePath, { recursive: true, force: true });
-        if (metadata.token)
-          localCompletedLocks.delete(lockPath);
         continue;
       }
       if (options.now() - startedAt >= options.timeoutMs) {
@@ -12795,10 +12800,16 @@ function installSystemdUnits(request) {
       if (legacyRelevant) {
         request.run(`systemctl --user stop ${request.legacyTimerUnit}`);
         request.run(`systemctl --user disable ${request.legacyTimerUnit}`);
+        if (legacyServiceSnapshot)
+          restoreFile(legacyServiceSnapshot, fileSystem);
+        if (legacyTimerSnapshot)
+          restoreFile(legacyTimerSnapshot, fileSystem);
       }
       atomicReplace(servicePath, request.serviceContent, 420, fileSystem);
       atomicReplace(timerPath, request.timerContent, 420, fileSystem);
       request.run("systemctl --user daemon-reload");
+      if (legacyRelevant)
+        request.run(`systemctl --user stop ${request.legacyTimerUnit}`);
       request.run(`systemctl --user enable ${request.timerUnit}`);
       enabledByAttempt = true;
       request.run(`systemctl --user start ${request.timerUnit}`);
