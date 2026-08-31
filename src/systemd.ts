@@ -160,23 +160,33 @@ function temporaryPath(path: string): string {
 
 function atomicReplace(path: string, content: string | Buffer, mode: number, fileSystem: SystemdFileSystem): void {
   const temporary = temporaryPath(path)
+  let primaryError: unknown
   try {
     fileSystem.writeFile(temporary, content, { mode })
     fileSystem.chmod(temporary, mode)
     fileSystem.rename(temporary, path)
     fileSystem.chmod(path, mode)
+  } catch (error) {
+    primaryError = error
+    throw error
   } finally {
-    removeNode(temporary, fileSystem)
+    if (primaryError) bestEffort(() => removeNode(temporary, fileSystem))
+    else removeNode(temporary, fileSystem)
   }
 }
 
 function atomicSymlink(path: string, target: string, fileSystem: SystemdFileSystem): void {
   const temporary = temporaryPath(path)
+  let primaryError: unknown
   try {
     fileSystem.symlink(target, temporary)
     fileSystem.rename(temporary, path)
+  } catch (error) {
+    primaryError = error
+    throw error
   } finally {
-    removeNode(temporary, fileSystem)
+    if (primaryError) bestEffort(() => removeNode(temporary, fileSystem))
+    else removeNode(temporary, fileSystem)
   }
 }
 
@@ -295,12 +305,32 @@ function acquireLock(
       return () => fileSystem.rm(lockPath, { recursive: true, force: true })
     } catch (error) {
       if (!isErrorCode(error, "EEXIST")) throw error
+      let lockStats: ReturnType<typeof lstatSync>
+      try {
+        lockStats = fileSystem.lstat(lockPath)
+      } catch (inspectError) {
+        if (isErrorCode(inspectError, "ENOENT")) continue
+        throw inspectError
+      }
+      if (lockStats.isSymbolicLink()) {
+        throw new Error(`Refusing systemd install lock symlink at ${lockPath}`)
+      }
+      if (!lockStats.isDirectory()) {
+        throw new Error(`Refusing non-directory systemd install lock at ${lockPath}`)
+      }
       const metadata = readLockMetadata(lockPath, fileSystem)
-      const timestamp = metadata.timestamp ?? fileSystem.lstat(lockPath).mtimeMs
+      const timestamp = metadata.timestamp ?? lockStats.mtimeMs
       const oldEnough = options.now() - timestamp >= options.staleAfterMs
       const ownerAlive = metadata.pid !== undefined && options.isPidAlive(metadata.pid)
       if (oldEnough && !ownerAlive) {
-        fileSystem.rm(lockPath, { recursive: true, force: true })
+        const quarantinePath = join(lockRoot, `${timerUnit}.stale-${options.pid}-${options.now()}-${temporaryFileSequence += 1}`)
+        try {
+          fileSystem.rename(lockPath, quarantinePath)
+        } catch (claimError) {
+          if (isErrorCode(claimError, "ENOENT") || isErrorCode(claimError, "EEXIST")) continue
+          throw claimError
+        }
+        fileSystem.rm(quarantinePath, { recursive: true, force: true })
         continue
       }
       if (options.now() - startedAt >= options.timeoutMs) {
@@ -319,6 +349,7 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
     fileSystem,
     request.lock
   )
+  let primaryError: unknown
   try {
     fileSystem.mkdir(request.unitDir, { recursive: true })
     const servicePath = join(request.unitDir, request.serviceUnit)
@@ -346,7 +377,11 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
       if (wasActive) bestEffort(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" }))
       throw error
     }
+  } catch (error) {
+    primaryError = error
+    throw error
   } finally {
-    releaseLock()
+    if (primaryError) bestEffort(releaseLock)
+    else releaseLock()
   }
 }
