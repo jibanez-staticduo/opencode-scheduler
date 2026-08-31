@@ -317,6 +317,86 @@ describe("installSystemdUnits transaction", () => {
     expect(existsSync(lockPath)).toBe(false)
   })
 
+  test("refuses a symlink lock without touching its target", () => {
+    const root = sandbox()
+    const lockRoot = join(root, "locks")
+    const target = join(root, "target")
+    mkdirSync(lockRoot)
+    mkdirSync(target)
+    writeFileSync(join(target, "keep"), "safe")
+    symlinkSync(target, join(lockRoot, "job.timer.lock"))
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    expect(() => installSystemdUnits({
+      unitDir: root, lockDir: lockRoot, serviceUnit: "job.service", timerUnit: "job.timer",
+      serviceContent: "new", timerContent: "new", run: fakeRunner(state),
+    })).toThrow("lock symlink")
+    expect(readFileSync(join(target, "keep"), "utf8")).toBe("safe")
+    expect(lstatSync(join(lockRoot, "job.timer.lock")).isSymbolicLink()).toBe(true)
+  })
+
+  test("reclaims stale lock with malformed metadata through quarantine", () => {
+    const root = sandbox()
+    const lockRoot = join(root, "locks")
+    const lockPath = join(lockRoot, "job.timer.lock")
+    mkdirSync(lockPath, { recursive: true })
+    writeFileSync(join(lockPath, "owner.json"), "not-json")
+    const old = new Date(0)
+    require("fs").utimesSync(lockPath, old, old)
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    installSystemdUnits({
+      unitDir: root, lockDir: lockRoot, serviceUnit: "job.service", timerUnit: "job.timer",
+      serviceContent: "new", timerContent: "new", run: fakeRunner(state),
+      lock: { staleAfterMs: 1, timeoutMs: 100 },
+    })
+    expect(existsSync(lockPath)).toBe(false)
+  })
+
+  test("PRIMARY_WRITE is not masked by CLEANUP_UNLINK", () => {
+    const root = sandbox()
+    const fileSystem = failingFileSystem("first-write")!
+    fileSystem.unlink = () => { throw new Error("CLEANUP_UNLINK") }
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    expect(() => installSystemdUnits({
+      unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+      serviceContent: "new", timerContent: "new", run: fakeRunner(state), fileSystem,
+    })).toThrow("first-write")
+  })
+
+  test("PRIMARY_RELOAD is not masked by LOCK_RELEASE", () => {
+    const root = sandbox()
+    const fileSystem = failingFileSystem() ?? {
+      chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
+      readlink: readlinkSync, rename: renameSync, rm: rmSync, stat: statSync, symlink: symlinkSync,
+      unlink: unlinkSync, writeFile: writeFileSync,
+    }
+    const originalRm = fileSystem.rm
+    fileSystem.rm = (path, options) => {
+      if (String(path).endsWith("job.timer.lock")) throw new Error("LOCK_RELEASE")
+      return originalRm(path, options)
+    }
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    expect(() => installSystemdUnits({
+      unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+      serviceContent: "new", timerContent: "new", run: fakeRunner(state, "daemon-reload"), fileSystem,
+    })).toThrow("daemon-reload")
+  })
+
+  test("successful transaction surfaces lock release failure", () => {
+    const root = sandbox()
+    const fileSystem: SystemdFileSystem = {
+      chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
+      readlink: readlinkSync, rename: renameSync, rm: (path, options) => {
+        if (String(path).endsWith("job.timer.lock")) throw new Error("LOCK_RELEASE")
+        return rmSync(path, options)
+      }, stat: statSync, symlink: symlinkSync, unlink: unlinkSync, writeFile: writeFileSync,
+    }
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    expect(() => installSystemdUnits({
+      unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+      serviceContent: "new", timerContent: "new", run: fakeRunner(state), fileSystem,
+    })).toThrow("LOCK_RELEASE")
+  })
+
   test("a second process cannot interleave with a live installer", async () => {
     const root = sandbox()
     const marker = join(root, "locked")
@@ -370,5 +450,27 @@ describe("installSystemdUnits transaction", () => {
     })
     expect(readFileSync(join(root, "job.service"), "utf8")).toBe("second service")
     expect(readFileSync(join(root, "job.timer"), "utf8")).toBe("second timer")
+  })
+
+  test("simultaneous stale reclaimers serialize through an atomic quarantine claim", async () => {
+    const root = sandbox()
+    const lockPath = join(root, "locks", "job.timer.lock")
+    const ledger = join(root, "ledger")
+    mkdirSync(lockPath, { recursive: true })
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: 2147483647, timestamp: 0 }))
+    const fixture = join(import.meta.dir, "fixtures", "systemd-stale-reclaimer.ts")
+    const children = ["a", "b", "c"].map((id) => spawn("bun", [fixture, root, ledger, id], { stdio: "ignore" }))
+    const exits = await Promise.all(children.map((child) => new Promise<number | null>((resolve) => child.once("exit", resolve))))
+    expect(exits).toEqual([0, 0, 0])
+    const events = readFileSync(ledger, "utf8").trim().split("\n")
+    let active = 0
+    let maximum = 0
+    for (const event of events) {
+      active += event.startsWith("start:") ? 1 : -1
+      maximum = Math.max(maximum, active)
+    }
+    expect(maximum).toBe(1)
+    expect(active).toBe(0)
+    expect(events).toHaveLength(6)
   })
 })
