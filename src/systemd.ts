@@ -153,8 +153,6 @@ interface LockHandle {
   release: () => void
 }
 
-const localCompletedLocks = new Map<string, string>()
-
 const sleepArray = new Int32Array(new SharedArrayBuffer(4))
 const defaultLockOptions: SystemdLockOptions = {
   timeoutMs: 10_000,
@@ -359,17 +357,31 @@ function acquireLock(
       }
       return {
         release() {
-          localCompletedLocks.set(lockPath, token)
-          try {
-            writeLockMetadata(lockPath, { pid: options.pid, timestamp: options.now(), token, phase: "completed" }, fileSystem)
-          } finally {
-            try {
-              fileSystem.rm(lockPath, { recursive: true, force: true })
-              localCompletedLocks.delete(lockPath)
-            } catch (error) {
-              throw error
-            }
+          const observed = readLockMetadata(lockPath, fileSystem)
+          if (observed.token !== token || observed.phase !== "active") {
+            throw new Error(`Refusing to release systemd lock whose ownership changed: ${lockPath}`)
           }
+          const observedStats = fileSystem.lstat(lockPath)
+          const quarantinePath = join(lockRoot, `${timerUnit}.release-${token}`)
+          fileSystem.rename(lockPath, quarantinePath)
+          const claimedStats = fileSystem.lstat(quarantinePath)
+          const claimed = readLockMetadata(quarantinePath, fileSystem)
+          if (
+            claimed.token !== token ||
+            claimed.phase !== "active" ||
+            claimedStats.dev !== observedStats.dev ||
+            claimedStats.ino !== observedStats.ino
+          ) {
+            // Never delete a node that was not the lock instance we observed.
+            try {
+              fileSystem.rename(quarantinePath, lockPath)
+            } catch (restoreError) {
+              if (!isErrorCode(restoreError, "EEXIST")) throw restoreError
+            }
+            throw new Error(`Systemd lock changed during release claim: ${lockPath}`)
+          }
+          writeLockMetadata(quarantinePath, { pid: options.pid, timestamp: options.now(), token, phase: "completed" }, fileSystem)
+          fileSystem.rm(quarantinePath, { recursive: true, force: true })
         },
       }
     } catch (error) {
@@ -391,8 +403,7 @@ function acquireLock(
       const timestamp = metadata.timestamp ?? lockStats.mtimeMs
       const oldEnough = options.now() - timestamp >= options.staleAfterMs
       const ownerAlive = metadata.pid !== undefined && options.isPidAlive(metadata.pid)
-      const locallyCompleted = metadata.token !== undefined && localCompletedLocks.get(lockPath) === metadata.token
-      if (metadata.phase === "completed" || locallyCompleted || (oldEnough && !ownerAlive)) {
+      if (metadata.phase === "completed" || (oldEnough && !ownerAlive)) {
         const quarantinePath = join(lockRoot, `${timerUnit}.stale-${options.pid}-${options.now()}-${temporaryFileSequence += 1}`)
         try {
           fileSystem.rename(lockPath, quarantinePath)
@@ -401,7 +412,6 @@ function acquireLock(
           throw claimError
         }
         fileSystem.rm(quarantinePath, { recursive: true, force: true })
-        if (metadata.token) localCompletedLocks.delete(lockPath)
         continue
       }
       if (options.now() - startedAt >= options.timeoutMs) {
@@ -454,10 +464,15 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
       if (legacyRelevant) {
         request.run(`systemctl --user stop ${request.legacyTimerUnit}`)
         request.run(`systemctl --user disable ${request.legacyTimerUnit}`)
+        // disable may unlink linked/alias unit nodes; preserve the exact legacy
+        // files while leaving the timer stopped and absent from target wants.
+        if (legacyServiceSnapshot) restoreFile(legacyServiceSnapshot, fileSystem)
+        if (legacyTimerSnapshot) restoreFile(legacyTimerSnapshot, fileSystem)
       }
       atomicReplace(servicePath, request.serviceContent, 0o644, fileSystem)
       atomicReplace(timerPath, request.timerContent, 0o644, fileSystem)
       request.run("systemctl --user daemon-reload")
+      if (legacyRelevant) request.run(`systemctl --user stop ${request.legacyTimerUnit}`)
       request.run(`systemctl --user enable ${request.timerUnit}`)
       enabledByAttempt = true
       request.run(`systemctl --user start ${request.timerUnit}`)
