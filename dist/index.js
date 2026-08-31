@@ -12336,9 +12336,9 @@ function tool(input) {
 tool.schema = exports_external;
 // src/index.ts
 import { createWriteStream, existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync, readFileSync as readFileSync2, rmSync as rmSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
-import { basename, dirname, join as join2, resolve as resolvePath } from "path";
+import { dirname, join as join2, resolve as resolvePath } from "path";
 import { homedir, platform } from "os";
-import { execFileSync, execSync, spawn } from "child_process";
+import { execFileSync as execFileSync2, spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 // src/cron.ts
@@ -12447,12 +12447,14 @@ import {
   writeFileSync
 } from "fs";
 import { join } from "path";
-var SAFE_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/;
-var SAFE_UNIT = /^[a-z0-9][a-z0-9-]{0,127}\.(service|timer)$/;
+var SAFE_IDENTIFIER = /^[a-z0-9][a-z0-9-]*$/;
+var SAFE_UNIT = /^[a-z0-9][a-z0-9-]*\.(service|timer)$/;
+var NAME_MAX_BYTES = 255;
 function validateInstallRequest(request) {
   const invalid = (label, value, pattern) => {
-    if (value !== undefined && !pattern.test(value))
+    if (value !== undefined && (!pattern.test(value) || Buffer.byteLength(value, "utf8") > NAME_MAX_BYTES)) {
       throw new Error(`Invalid ${label}: ${JSON.stringify(value)}`);
+    }
   };
   invalid("service unit", request.serviceUnit, SAFE_UNIT);
   invalid("timer unit", request.timerUnit, SAFE_UNIT);
@@ -12895,6 +12897,45 @@ function installLinuxScheduler(dependencies) {
   return installSystemdWithCronFallback(dependencies);
 }
 
+// src/process.ts
+import { execFileSync } from "child_process";
+function readExecutableVersion(executable, env, execute = (file2, args, options) => execFileSync(file2, [...args], options)) {
+  try {
+    const output = execute(executable, ["--version"], { env }).toString().trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+// src/identifiers.ts
+import { basename, resolve } from "path";
+var NAME_MAX_BYTES2 = 255;
+var SAFE_IDENTIFIER2 = /^[a-z0-9][a-z0-9-]*$/;
+function slugifyIdentifier(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+function fnv1a64Hex(input) {
+  let hash2 = 0xcbf29ce484222325n;
+  const data = Buffer.from(input, "utf8");
+  for (const byte of data) {
+    hash2 ^= BigInt(byte);
+    hash2 = hash2 * 0x100000001b3n & 0xffffffffffffffffn;
+  }
+  return hash2.toString(16).padStart(16, "0");
+}
+function deriveSafeScopeId(workdir) {
+  const normalized = resolve(workdir.trim());
+  const rawBase = slugifyIdentifier(basename(normalized)) || "workspace";
+  const suffix = fnv1a64Hex(normalized).slice(0, 12);
+  const maxBaseBytes = 96 - suffix.length - 1;
+  const base = rawBase.slice(0, maxBaseBytes).replace(/-+$/g, "") || "workspace";
+  return `${base}-${suffix}`;
+}
+function isSafeIdentifier(value) {
+  return SAFE_IDENTIFIER2.test(value);
+}
+
 // src/index.ts
 var OPENCODE_CONFIG = join2(homedir(), ".config", "opencode");
 var LEGACY_JOBS_DIR = join2(OPENCODE_CONFIG, "jobs");
@@ -12920,13 +12961,26 @@ function ensureDir(dir) {
 function slugify(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
-var SAFE_JOB_IDENTIFIER = /^[a-z0-9][a-z0-9-]{0,127}$/;
+function byteLength(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+function validateSafeIdentifier(label, value) {
+  if (!isSafeIdentifier(value))
+    throw new Error(`Invalid job ${label}: ${JSON.stringify(value)}`);
+}
 function validateJobIdentifiers(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
-  if (!SAFE_JOB_IDENTIFIER.test(scopeId))
-    throw new Error(`Invalid job scopeId: ${JSON.stringify(scopeId)}`);
-  if (!SAFE_JOB_IDENTIFIER.test(job.slug))
-    throw new Error(`Invalid job slug: ${JSON.stringify(job.slug)}`);
+  validateSafeIdentifier("scopeId", scopeId);
+  validateSafeIdentifier("slug", job.slug);
+  const names = [
+    `opencode-job-${scopeId}-${job.slug}.service`,
+    `opencode-job-${scopeId}-${job.slug}.timer`,
+    `opencode-job-${job.slug}.service`,
+    `opencode-job-${job.slug}.timer`
+  ];
+  if (names.some((name) => byteLength(name) > NAME_MAX_BYTES2)) {
+    throw new Error("Job scopeId/slug exceeds the platform unit filename limit");
+  }
 }
 function normalizeWorkdirPath(input) {
   const trimmed = input.trim();
@@ -12934,24 +12988,8 @@ function normalizeWorkdirPath(input) {
     return homedir();
   return resolvePath(trimmed);
 }
-function fnv1a64(input) {
-  let hash2 = 0xcbf29ce484222325n;
-  const prime = 0x100000001b3n;
-  const data = Buffer.from(input, "utf8");
-  for (const byte of data) {
-    hash2 ^= BigInt(byte);
-    hash2 = hash2 * prime & 0xffffffffffffffffn;
-  }
-  return hash2;
-}
-function fnv1a64Hex(input) {
-  return fnv1a64(input).toString(16).padStart(16, "0");
-}
 function deriveScopeId(workdir) {
-  const normalized = normalizeWorkdirPath(workdir);
-  const base = slugify(basename(normalized)) || "workspace";
-  const suffix = fnv1a64Hex(normalized).slice(0, 12);
-  return `${base}-${suffix}`;
+  return deriveSafeScopeId(normalizeWorkdirPath(workdir));
 }
 function scopeDir(scopeId) {
   return join2(SCOPES_DIR, scopeId);
@@ -13396,15 +13434,11 @@ function findOpencode() {
   if (override)
     return override;
   try {
-    const resolved = execSync("command -v opencode", {
+    execFileSync2("opencode", ["--version"], {
       env: { ...process.env, PATH: getEnhancedPath() + ":" + (process.env.PATH ?? "") },
-      stdio: ["ignore", "pipe", "ignore"]
-    }).toString().trim();
-    if (resolved) {
-      if (resolved.includes("/"))
-        return resolved;
-      return "opencode";
-    }
+      stdio: "ignore"
+    });
+    return "opencode";
   } catch {}
   const paths = [
     "/opt/homebrew/bin/opencode",
@@ -13670,16 +13704,16 @@ function installLaunchdJob(job) {
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
   const plistPath = join2(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
-    execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" });
+    execFileSync2("launchctl", ["unload", plistPath], { stdio: "ignore" });
   } catch {}
   if (existsSync2(legacyPlistPath)) {
     try {
-      execFileSync("launchctl", ["unload", legacyPlistPath], { stdio: "ignore" });
+      execFileSync2("launchctl", ["unload", legacyPlistPath], { stdio: "ignore" });
     } catch {}
   }
   const plist = createLaunchdPlist(job);
   writeFileSync2(plistPath, plist);
-  execFileSync("launchctl", ["load", plistPath]);
+  execFileSync2("launchctl", ["load", plistPath]);
 }
 function uninstallLaunchdJob(job) {
   validateJobIdentifiers(job);
@@ -13692,7 +13726,7 @@ function uninstallLaunchdJob(job) {
     if (!existsSync2(plistPath))
       continue;
     try {
-      execFileSync("launchctl", ["unload", plistPath], { stdio: "ignore" });
+      execFileSync2("launchctl", ["unload", plistPath], { stdio: "ignore" });
     } catch {}
     try {
       unlinkSync2(plistPath);
@@ -13708,7 +13742,7 @@ function systemdRunEnv() {
   });
 }
 function defaultSystemdCommandRunner(executable, args, options) {
-  return execFileSync(executable, [...args], { ...options, env: systemdRunEnv() });
+  return execFileSync2(executable, [...args], { ...options, env: systemdRunEnv() });
 }
 function systemdExecSync(args, options) {
   return defaultSystemdCommandRunner("systemctl", args, options);
@@ -13809,7 +13843,7 @@ function installWindowsJob(job) {
   uninstallWindowsJob(job);
   const taskDefinitions = cronToWindowsTaskDefinitions(job);
   for (const task of taskDefinitions) {
-    execFileSync("schtasks", task.args, { stdio: "ignore" });
+    execFileSync2("schtasks", task.args, { stdio: "ignore" });
   }
 }
 function uninstallWindowsJob(job) {
@@ -13824,13 +13858,15 @@ function uninstallWindowsJob(job) {
   }
   for (const taskName of candidates) {
     try {
-      execFileSync("schtasks", ["/Delete", "/TN", taskName, "/F"], { stdio: "ignore" });
+      execFileSync2("schtasks", ["/Delete", "/TN", taskName, "/F"], { stdio: "ignore" });
     } catch {}
   }
 }
 function isCommandAvailable(command) {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(command))
+    return false;
   try {
-    execSync(`command -v ${command}`, {
+    execFileSync2(command, ["--version"], {
       stdio: "ignore",
       env: buildRunEnvironment()
     });
@@ -13876,7 +13912,7 @@ function shellEscapeDoubleQuoted(value) {
 }
 function readUserCrontab() {
   try {
-    return execFileSync("crontab", ["-l"], { encoding: "utf-8" });
+    return execFileSync2("crontab", ["-l"], { encoding: "utf-8" });
   } catch (error45) {
     const status = typeof error45 === "object" && error45 !== null ? error45.status : undefined;
     const stderrValue = typeof error45 === "object" && error45 !== null && "stderr" in error45 ? error45.stderr : undefined;
@@ -13891,7 +13927,7 @@ function writeUserCrontab(content) {
   const normalized = content.trim();
   const input = normalized ? `${normalized}
 ` : "";
-  execFileSync("crontab", ["-"], { input });
+  execFileSync2("crontab", ["-"], { input });
 }
 function stripManagedCronBlocks(content, blockIds) {
   const lines = content ? content.split(/\r?\n/) : [];
@@ -14641,12 +14677,7 @@ function loadSchedulerConfig() {
   }
 }
 function getOpencodeVersion(opencodePath) {
-  try {
-    const output = execSync(`"${opencodePath}" --version`, { env: buildRunEnvironment() }).toString().trim();
-    return output || null;
-  } catch {
-    return null;
-  }
+  return readExecutableVersion(opencodePath, buildRunEnvironment());
 }
 function runJobNow(job) {
   ensureDir(LOGS_DIR);
@@ -14840,7 +14871,7 @@ function getJobLogs(job, options) {
     if (typeof tailLines === "number" && Number.isFinite(tailLines) && tailLines > 0) {
       const clampedLines = Math.max(1, Math.min(5000, Math.floor(tailLines)));
       try {
-        const output = execFileSync("tail", ["-n", String(clampedLines), logPath], {
+        const output = execFileSync2("tail", ["-n", String(clampedLines), logPath], {
           env: buildRunEnvironment()
         }).toString();
         return output.length > maxChars ? output.slice(-maxChars) : output;
