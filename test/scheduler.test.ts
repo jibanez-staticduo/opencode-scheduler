@@ -19,9 +19,11 @@ import { tmpdir } from "os"
 import { join } from "path"
 import { spawn, spawnSync } from "child_process"
 import { cronToSystemdCalendars } from "../src/cron"
-import { installSystemdWithCronFallback } from "../src/backend"
+import { installLinuxScheduler, installSystemdWithCronFallback } from "../src/backend"
 import {
   installSystemdUnits,
+  SystemdFallbackSafeError,
+  SystemdNonFallbackError,
   withSystemdRuntimeEnv,
   type SystemdCommandRunner,
   type SystemdFileSystem,
@@ -525,14 +527,84 @@ describe("systemd backend fallback integration", () => {
     expect(readFileSync(join(root, "job.timer"), "utf8")).toBe("timer")
   })
 
-  test("true pre-commit systemd failure still installs cron fallback", () => {
+  test("genuine backend unavailable selection installs cron exactly once", () => {
+    let cronInstalls = 0
+    let systemdInstalls = 0
+    const selectedBackend = installLinuxScheduler({
+      systemdAvailable: false,
+      installSystemd: () => { systemdInstalls += 1 },
+      isCronAvailable: () => true,
+      installCron: () => { cronInstalls += 1 },
+    })
+    expect(selectedBackend).toBe("cron")
+    expect(cronInstalls).toBe(1)
+    expect(systemdInstalls).toBe(0)
+  })
+
+  test("fully rolled-back clean install failure installs cron exactly once", () => {
     let cronInstalls = 0
     const backend = installSystemdWithCronFallback({
-      installSystemd: () => { throw new Error("SYSTEMD_FAILED") },
+      installSystemd: () => { throw new SystemdFallbackSafeError("SYSTEMD_FAILED") },
       isCronAvailable: () => true,
       installCron: () => { cronInstalls += 1 },
     })
     expect(backend).toBe("cron")
     expect(cronInstalls).toBe(1)
+  })
+
+  test("live lock timeout is non-fallback and starts neither backend", () => {
+    const root = sandbox()
+    const lockPath = join(root, "locks", "job.timer.lock")
+    mkdirSync(lockPath, { recursive: true })
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid, timestamp: Date.now() }))
+    let systemdTransactions = 0
+    let cronInstalls = 0
+    expect(() => installSystemdWithCronFallback({
+      installSystemd: () => installSystemdUnits({
+        unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+        serviceContent: "service", timerContent: "timer", run: () => { systemdTransactions += 1; return Buffer.alloc(0) },
+        lock: { timeoutMs: 5, pollMs: 1 },
+      }),
+      isCronAvailable: () => true,
+      installCron: () => { cronInstalls += 1 },
+    })).toThrow(SystemdNonFallbackError)
+    expect(systemdTransactions).toBe(0)
+    expect(cronInstalls).toBe(0)
+  })
+
+  test("real clean transaction failure rolls back before safe cron fallback", () => {
+    const root = sandbox()
+    let cronInstalls = 0
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    const backend = installSystemdWithCronFallback({
+      installSystemd: () => installSystemdUnits({
+        unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+        serviceContent: "service", timerContent: "timer", run: fakeRunner(state, "daemon-reload"),
+      }),
+      isCronAvailable: () => true,
+      installCron: () => { cronInstalls += 1 },
+    })
+    expect(backend).toBe("cron")
+    expect(cronInstalls).toBe(1)
+    expect(existsSync(join(root, "job.service"))).toBe(false)
+    expect(existsSync(join(root, "job.timer"))).toBe(false)
+  })
+
+  test("existing schedule transaction failure is non-fallback even after restoration", () => {
+    const root = sandbox()
+    writeFileSync(join(root, "job.service"), "old service")
+    writeFileSync(join(root, "job.timer"), "old timer")
+    let cronInstalls = 0
+    const state: FakeState = { unitFileState: "enabled", active: true, calls: [] }
+    expect(() => installSystemdWithCronFallback({
+      installSystemd: () => installSystemdUnits({
+        unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+        serviceContent: "new", timerContent: "new", run: fakeRunner(state, "daemon-reload"),
+      }),
+      isCronAvailable: () => true,
+      installCron: () => { cronInstalls += 1 },
+    })).toThrow(SystemdNonFallbackError)
+    expect(cronInstalls).toBe(0)
+    expect(readFileSync(join(root, "job.timer"), "utf8")).toBe("old timer")
   })
 })
