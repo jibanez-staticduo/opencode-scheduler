@@ -126,9 +126,15 @@ function queryTimerState(run: SystemdCommandRunner, timerUnit: string, query: "i
   } catch (error) {
     output = commandOutput(error)
   }
-  return query === "is-enabled"
-    ? ["enabled", "enabled-runtime", "linked", "linked-runtime", "alias"].includes(output)
-    : ["active", "activating", "reloading"].includes(output)
+  const enabledStates = ["enabled", "enabled-runtime", "linked", "linked-runtime", "alias"]
+  const disabledStates = ["disabled", "static", "indirect", "masked", "masked-runtime", "not-found"]
+  const activeStates = ["active", "activating", "reloading"]
+  const inactiveStates = ["inactive", "failed", "deactivating", "unknown"]
+  if (query === "is-enabled" && enabledStates.includes(output)) return true
+  if (query === "is-enabled" && disabledStates.includes(output)) return false
+  if (query === "is-active" && activeStates.includes(output)) return true
+  if (query === "is-active" && inactiveStates.includes(output)) return false
+  throw new Error(`Unable to determine whether ${timerUnit} ${query}: ${output || "no status returned"}`)
 }
 
 function restoreFile(snapshot: FileSnapshot, fileSystem: SystemdFileSystem): void {

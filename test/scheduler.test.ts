@@ -149,6 +149,25 @@ function install(root: string, state: FakeState, failure?: FailurePoint): void {
 }
 
 describe("installSystemdUnits transaction", () => {
+  test("aborts before mutation when prior timer state cannot be captured", () => {
+    const root = sandbox()
+    const service = join(root, "job.service")
+    writeFileSync(service, "old service")
+    const run: SystemdCommandRunner = () => {
+      throw new Error("bus unavailable")
+    }
+    expect(() => installSystemdUnits({
+      unitDir: root,
+      serviceUnit: "job.service",
+      timerUnit: "job.timer",
+      serviceContent: "new service",
+      timerContent: "new timer",
+      run,
+    })).toThrow("Unable to determine")
+    expect(readFileSync(service, "utf8")).toBe("old service")
+    expect(existsSync(join(root, "job.timer"))).toBe(false)
+  })
+
   test("clean install writes 0644 files and starts an enabled timer", () => {
     const root = sandbox()
     const state: FakeState = { enabled: false, active: false, calls: [] }
