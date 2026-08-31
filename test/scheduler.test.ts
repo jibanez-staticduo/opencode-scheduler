@@ -19,6 +19,7 @@ import { tmpdir } from "os"
 import { join } from "path"
 import { spawn, spawnSync } from "child_process"
 import { cronToSystemdCalendars } from "../src/cron"
+import { installSystemdWithCronFallback } from "../src/backend"
 import {
   installSystemdUnits,
   withSystemdRuntimeEnv,
@@ -381,7 +382,7 @@ describe("installSystemdUnits transaction", () => {
     })).toThrow("daemon-reload")
   })
 
-  test("successful transaction surfaces lock release failure", () => {
+  test("successful transaction reports lock release warning without failing", () => {
     const root = sandbox()
     const fileSystem: SystemdFileSystem = {
       chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
@@ -391,10 +392,33 @@ describe("installSystemdUnits transaction", () => {
       }, stat: statSync, symlink: symlinkSync, unlink: unlinkSync, writeFile: writeFileSync,
     }
     const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    const warnings: Array<{ message: string; error: unknown }> = []
+    installSystemdUnits({
+      unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+      serviceContent: "new", timerContent: "new", run: fakeRunner(state), fileSystem,
+      onWarning: (message, error) => warnings.push({ message, error }),
+    })
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].message).toContain("is installed")
+    expect(warnings[0].error).toBeInstanceOf(Error)
+  })
+
+  test("OWNER_WRITE is not masked by OWNER_CLEANUP", () => {
+    const root = sandbox()
+    const fileSystem: SystemdFileSystem = {
+      chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
+      readlink: readlinkSync, rename: renameSync, rm: () => { throw new Error("OWNER_CLEANUP") },
+      stat: statSync, symlink: symlinkSync, unlink: unlinkSync,
+      writeFile: (path, data, options) => {
+        if (String(path).endsWith("owner.json")) throw new Error("OWNER_WRITE")
+        writeFileSync(path, data, options)
+      },
+    }
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
     expect(() => installSystemdUnits({
       unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
       serviceContent: "new", timerContent: "new", run: fakeRunner(state), fileSystem,
-    })).toThrow("LOCK_RELEASE")
+    })).toThrow("OWNER_WRITE")
   })
 
   test("a second process cannot interleave with a live installer", async () => {
@@ -472,5 +496,43 @@ describe("installSystemdUnits transaction", () => {
     expect(maximum).toBe(1)
     expect(active).toBe(0)
     expect(events).toHaveLength(6)
+  })
+})
+
+describe("systemd backend fallback integration", () => {
+  test("post-commit lock warning leaves exactly one systemd schedule and no cron fallback", () => {
+    const root = sandbox()
+    let cronInstalls = 0
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    const fileSystem: SystemdFileSystem = {
+      chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
+      readlink: readlinkSync, rename: renameSync, rm: (path, options) => {
+        if (String(path).endsWith("job.timer.lock")) throw new Error("LOCK_RELEASE")
+        return rmSync(path, options)
+      }, stat: statSync, symlink: symlinkSync, unlink: unlinkSync, writeFile: writeFileSync,
+    }
+    const backend = installSystemdWithCronFallback({
+      installSystemd: () => installSystemdUnits({
+        unitDir: root, lockDir: join(root, "locks"), serviceUnit: "job.service", timerUnit: "job.timer",
+        serviceContent: "service", timerContent: "timer", run: fakeRunner(state), fileSystem,
+      }),
+      isCronAvailable: () => true,
+      installCron: () => { cronInstalls += 1 },
+    })
+    expect(backend).toBe("systemd")
+    expect(cronInstalls).toBe(0)
+    expect(state.calls.filter((call) => call.includes(" start "))).toHaveLength(1)
+    expect(readFileSync(join(root, "job.timer"), "utf8")).toBe("timer")
+  })
+
+  test("true pre-commit systemd failure still installs cron fallback", () => {
+    let cronInstalls = 0
+    const backend = installSystemdWithCronFallback({
+      installSystemd: () => { throw new Error("SYSTEMD_FAILED") },
+      isCronAvailable: () => true,
+      installCron: () => { cronInstalls += 1 },
+    })
+    expect(backend).toBe("cron")
+    expect(cronInstalls).toBe(1)
   })
 })
