@@ -74,6 +74,7 @@ export interface SystemdInstallRequest {
   run: SystemdCommandRunner
   fileSystem?: SystemdFileSystem
   lock?: Partial<SystemdLockOptions>
+  onWarning?: (message: string, error: unknown) => void
 }
 
 export interface SystemdFileSystem {
@@ -299,7 +300,7 @@ function acquireLock(
       try {
         fileSystem.writeFile(join(lockPath, "owner.json"), JSON.stringify({ pid: options.pid, timestamp: options.now() }))
       } catch (error) {
-        fileSystem.rm(lockPath, { recursive: true, force: true })
+        bestEffort(() => fileSystem.rm(lockPath, { recursive: true, force: true }))
         throw error
       }
       return () => fileSystem.rm(lockPath, { recursive: true, force: true })
@@ -382,6 +383,15 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
     throw error
   } finally {
     if (primaryError) bestEffort(releaseLock)
-    else releaseLock()
+    else {
+      try {
+        releaseLock()
+      } catch (error) {
+        request.onWarning?.(
+          `Systemd schedule ${request.timerUnit} is installed, but its install lock could not be removed; cron fallback was not installed.`,
+          error
+        )
+      }
+    }
   }
 }

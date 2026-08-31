@@ -16,6 +16,7 @@ export interface SystemdInstallRequest {
     run: SystemdCommandRunner;
     fileSystem?: SystemdFileSystem;
     lock?: Partial<SystemdLockOptions>;
+    onWarning?: (message: string, error: unknown) => void;
 }
 export interface SystemdFileSystem {
     chmod: typeof chmodSync;

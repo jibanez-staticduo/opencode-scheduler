@@ -12669,7 +12669,7 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
       try {
         fileSystem.writeFile(join(lockPath, "owner.json"), JSON.stringify({ pid: options.pid, timestamp: options.now() }));
       } catch (error45) {
-        fileSystem.rm(lockPath, { recursive: true, force: true });
+        bestEffort(() => fileSystem.rm(lockPath, { recursive: true, force: true }));
         throw error45;
       }
       return () => fileSystem.rm(lockPath, { recursive: true, force: true });
@@ -12752,8 +12752,26 @@ function installSystemdUnits(request) {
   } finally {
     if (primaryError)
       bestEffort(releaseLock);
-    else
-      releaseLock();
+    else {
+      try {
+        releaseLock();
+      } catch (error45) {
+        request.onWarning?.(`Systemd schedule ${request.timerUnit} is installed, but its install lock could not be removed; cron fallback was not installed.`, error45);
+      }
+    }
+  }
+}
+
+// src/backend.ts
+function installSystemdWithCronFallback(dependencies) {
+  try {
+    dependencies.installSystemd();
+    return "systemd";
+  } catch (error45) {
+    if (!dependencies.isCronAvailable())
+      throw error45;
+    dependencies.installCron();
+    return "cron";
   }
 }
 
@@ -13619,7 +13637,11 @@ function installSystemdJob(job, run = defaultSystemdCommandRunner) {
     timerUnit,
     serviceContent: createSystemdService(job),
     timerContent: createSystemdTimer(job),
-    run
+    run,
+    onWarning(message, error45) {
+      const detail = error45 instanceof Error ? error45.message : String(error45);
+      console.warn(`[opencode-scheduler] ${message} ${detail}`);
+    }
   });
 }
 function uninstallSystemdJob(job) {
@@ -13828,15 +13850,11 @@ function installJob(job) {
   if (backend === "launchd") {
     installLaunchdJob(job);
   } else if (backend === "systemd") {
-    try {
-      installSystemdJob(job);
-    } catch (error45) {
-      if (!isCronAvailable()) {
-        throw error45;
-      }
-      installCronJob(job);
-      return "cron";
-    }
+    return installSystemdWithCronFallback({
+      installSystemd: () => installSystemdJob(job),
+      isCronAvailable,
+      installCron: () => installCronJob(job)
+    });
   } else if (backend === "schtasks") {
     installWindowsJob(job);
   } else {
