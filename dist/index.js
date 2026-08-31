@@ -12335,7 +12335,7 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // src/index.ts
-import { createWriteStream, existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync, readFileSync as readFileSync2, rmSync, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
+import { createWriteStream, existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync, readFileSync as readFileSync2, rmSync as rmSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
 import { basename, dirname, join as join2, resolve as resolvePath } from "path";
 import { homedir, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
@@ -12435,10 +12435,14 @@ function cronToSystemdCalendars(cron) {
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
+  rmSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync
 } from "fs";
@@ -12467,36 +12471,83 @@ function withSystemdRuntimeEnv(env, dependencies = defaultRuntimeEnvDependencies
 var defaultFileSystem = {
   chmod: chmodSync,
   exists: existsSync,
+  lstat: lstatSync,
   mkdir: mkdirSync,
   readFile: readFileSync,
+  readlink: readlinkSync,
   rename: renameSync,
+  rm: rmSync,
   stat: statSync,
+  symlink: symlinkSync,
   unlink: unlinkSync,
   writeFile: writeFileSync
 };
+var sleepArray = new Int32Array(new SharedArrayBuffer(4));
+var defaultLockOptions = {
+  timeoutMs: 1e4,
+  staleAfterMs: 60000,
+  pollMs: 25,
+  now: Date.now,
+  pid: process.pid,
+  isPidAlive(pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  sleep(milliseconds) {
+    Atomics.wait(sleepArray, 0, 0, milliseconds);
+  }
+};
 function snapshotFile(path, fileSystem) {
-  if (!fileSystem.exists(path))
-    return { path, existed: false };
-  return {
-    path,
-    existed: true,
-    content: fileSystem.readFile(path),
-    mode: fileSystem.stat(path).mode & 511
-  };
+  let stats;
+  try {
+    stats = fileSystem.lstat(path);
+  } catch (error45) {
+    if (isErrorCode(error45, "ENOENT"))
+      return { path, type: "missing" };
+    throw error45;
+  }
+  if (stats.isSymbolicLink())
+    return { path, type: "symlink", target: fileSystem.readlink(path) };
+  if (stats.isFile()) {
+    return { path, type: "regular", content: fileSystem.readFile(path), mode: stats.mode & 511 };
+  }
+  throw new Error(`Unsupported systemd unit node type at ${path}; refusing to mutate it`);
 }
 var temporaryFileSequence = 0;
-function atomicReplace(path, content, mode, fileSystem) {
+function temporaryPath(path) {
   temporaryFileSequence += 1;
-  const temporaryPath = `${path}.tmp-${process.pid}-${temporaryFileSequence}`;
+  return `${path}.tmp-${process.pid}-${temporaryFileSequence}`;
+}
+function atomicReplace(path, content, mode, fileSystem) {
+  const temporary = temporaryPath(path);
   try {
-    fileSystem.writeFile(temporaryPath, content, { mode });
-    fileSystem.chmod(temporaryPath, mode);
-    fileSystem.rename(temporaryPath, path);
+    fileSystem.writeFile(temporary, content, { mode });
+    fileSystem.chmod(temporary, mode);
+    fileSystem.rename(temporary, path);
     fileSystem.chmod(path, mode);
   } finally {
-    try {
-      fileSystem.unlink(temporaryPath);
-    } catch {}
+    removeNode(temporary, fileSystem);
+  }
+}
+function atomicSymlink(path, target, fileSystem) {
+  const temporary = temporaryPath(path);
+  try {
+    fileSystem.symlink(target, temporary);
+    fileSystem.rename(temporary, path);
+  } finally {
+    removeNode(temporary, fileSystem);
+  }
+}
+function removeNode(path, fileSystem) {
+  try {
+    fileSystem.unlink(path);
+  } catch (error45) {
+    if (!isErrorCode(error45, "ENOENT"))
+      throw error45;
   }
 }
 function commandOutput(value) {
@@ -12513,69 +12564,153 @@ function commandOutput(value) {
   }
   return "";
 }
-function queryTimerState(run, timerUnit, query) {
+function queryUnitFileState(run, timerUnit) {
   let output = "";
   try {
-    output = commandOutput(run(`systemctl --user ${query} ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }));
+    output = commandOutput(run(`systemctl --user is-enabled ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }));
   } catch (error45) {
     output = commandOutput(error45);
   }
-  const enabledStates = ["enabled", "enabled-runtime", "linked", "linked-runtime", "alias"];
-  const disabledStates = ["disabled", "static", "indirect", "masked", "masked-runtime", "not-found"];
-  const activeStates = ["active", "activating", "reloading"];
-  const inactiveStates = ["inactive", "failed", "deactivating", "unknown"];
-  if (query === "is-enabled" && enabledStates.includes(output))
+  const supported = [
+    "enabled",
+    "enabled-runtime",
+    "disabled",
+    "static",
+    "indirect",
+    "masked",
+    "masked-runtime",
+    "linked",
+    "linked-runtime",
+    "alias",
+    "not-found"
+  ];
+  if (supported.includes(output))
+    return output;
+  const unrecoverable = ["generated", "transient", "bad"];
+  if (unrecoverable.includes(output)) {
+    throw new Error(`Cannot safely restore ${timerUnit} from systemd unit-file state ${output}; refusing to mutate it`);
+  }
+  throw new Error(`Unable to determine ${timerUnit} unit-file state: ${output || "no status returned"}`);
+}
+function queryActiveState(run, timerUnit) {
+  let output = "";
+  try {
+    output = commandOutput(run(`systemctl --user is-active ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }));
+  } catch (error45) {
+    output = commandOutput(error45);
+  }
+  if (["active", "activating", "reloading"].includes(output))
     return true;
-  if (query === "is-enabled" && disabledStates.includes(output))
+  if (["inactive", "failed", "deactivating", "unknown"].includes(output))
     return false;
-  if (query === "is-active" && activeStates.includes(output))
-    return true;
-  if (query === "is-active" && inactiveStates.includes(output))
-    return false;
-  throw new Error(`Unable to determine whether ${timerUnit} ${query}: ${output || "no status returned"}`);
+  throw new Error(`Unable to determine whether ${timerUnit} is active: ${output || "no status returned"}`);
 }
 function restoreFile(snapshot, fileSystem) {
-  if (!snapshot.existed) {
-    try {
-      fileSystem.unlink(snapshot.path);
-    } catch {}
-    return;
+  if (snapshot.type === "missing") {
+    removeNode(snapshot.path, fileSystem);
+  } else if (snapshot.type === "symlink") {
+    atomicSymlink(snapshot.path, snapshot.target, fileSystem);
+  } else {
+    atomicReplace(snapshot.path, snapshot.content, snapshot.mode, fileSystem);
   }
-  atomicReplace(snapshot.path, snapshot.content ?? Buffer.alloc(0), snapshot.mode ?? 420, fileSystem);
 }
 function bestEffort(action) {
   try {
     action();
   } catch {}
 }
+function restoreUnitFileState(run, timerUnit, state) {
+  if (state === "enabled")
+    run(`systemctl --user enable ${timerUnit}`, { stdio: "ignore" });
+  if (state === "enabled-runtime")
+    run(`systemctl --user enable --runtime ${timerUnit}`, { stdio: "ignore" });
+  if (state === "disabled")
+    run(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
+}
+function isErrorCode(error45, code) {
+  return typeof error45 === "object" && error45 !== null && "code" in error45 && error45.code === code;
+}
+function readLockMetadata(lockPath, fileSystem) {
+  try {
+    const parsed = JSON.parse(fileSystem.readFile(join(lockPath, "owner.json"), "utf8"));
+    if (typeof parsed !== "object" || parsed === null)
+      return {};
+    const record2 = parsed;
+    return {
+      pid: typeof record2.pid === "number" ? record2.pid : undefined,
+      timestamp: typeof record2.timestamp === "number" ? record2.timestamp : undefined
+    };
+  } catch {
+    return {};
+  }
+}
+function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
+  const options = { ...defaultLockOptions, ...overrides };
+  fileSystem.mkdir(lockRoot, { recursive: true });
+  const lockPath = join(lockRoot, `${timerUnit}.lock`);
+  const startedAt = options.now();
+  while (true) {
+    try {
+      fileSystem.mkdir(lockPath);
+      try {
+        fileSystem.writeFile(join(lockPath, "owner.json"), JSON.stringify({ pid: options.pid, timestamp: options.now() }));
+      } catch (error45) {
+        fileSystem.rm(lockPath, { recursive: true, force: true });
+        throw error45;
+      }
+      return () => fileSystem.rm(lockPath, { recursive: true, force: true });
+    } catch (error45) {
+      if (!isErrorCode(error45, "EEXIST"))
+        throw error45;
+      const metadata = readLockMetadata(lockPath, fileSystem);
+      const timestamp = metadata.timestamp ?? fileSystem.lstat(lockPath).mtimeMs;
+      const oldEnough = options.now() - timestamp >= options.staleAfterMs;
+      const ownerAlive = metadata.pid !== undefined && options.isPidAlive(metadata.pid);
+      if (oldEnough && !ownerAlive) {
+        fileSystem.rm(lockPath, { recursive: true, force: true });
+        continue;
+      }
+      if (options.now() - startedAt >= options.timeoutMs) {
+        throw new Error(`Timed out waiting ${options.timeoutMs}ms for systemd install lock ${lockPath}`);
+      }
+      options.sleep(options.pollMs);
+    }
+  }
+}
 function installSystemdUnits(request) {
   const fileSystem = request.fileSystem ?? defaultFileSystem;
-  fileSystem.mkdir(request.unitDir, { recursive: true });
-  const servicePath = join(request.unitDir, request.serviceUnit);
-  const timerPath = join(request.unitDir, request.timerUnit);
-  const serviceSnapshot = snapshotFile(servicePath, fileSystem);
-  const timerSnapshot = snapshotFile(timerPath, fileSystem);
-  const wasEnabled = queryTimerState(request.run, request.timerUnit, "is-enabled");
-  const wasActive = queryTimerState(request.run, request.timerUnit, "is-active");
+  const releaseLock = acquireLock(request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"), request.timerUnit, fileSystem, request.lock);
   try {
-    atomicReplace(servicePath, request.serviceContent, 420, fileSystem);
-    atomicReplace(timerPath, request.timerContent, 420, fileSystem);
-    request.run("systemctl --user daemon-reload");
-    request.run(`systemctl --user enable ${request.timerUnit}`);
-    request.run(`systemctl --user start ${request.timerUnit}`);
-  } catch (error45) {
-    if (!wasActive)
-      bestEffort(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" }));
-    if (!wasEnabled)
-      bestEffort(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" }));
-    bestEffort(() => restoreFile(serviceSnapshot, fileSystem));
-    bestEffort(() => restoreFile(timerSnapshot, fileSystem));
-    bestEffort(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" }));
-    if (wasEnabled)
-      bestEffort(() => request.run(`systemctl --user enable ${request.timerUnit}`, { stdio: "ignore" }));
-    if (wasActive)
-      bestEffort(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" }));
-    throw error45;
+    fileSystem.mkdir(request.unitDir, { recursive: true });
+    const servicePath = join(request.unitDir, request.serviceUnit);
+    const timerPath = join(request.unitDir, request.timerUnit);
+    const serviceSnapshot = snapshotFile(servicePath, fileSystem);
+    const timerSnapshot = snapshotFile(timerPath, fileSystem);
+    const unitFileState = queryUnitFileState(request.run, request.timerUnit);
+    const wasActive = queryActiveState(request.run, request.timerUnit);
+    let enabledByAttempt = false;
+    try {
+      atomicReplace(servicePath, request.serviceContent, 420, fileSystem);
+      atomicReplace(timerPath, request.timerContent, 420, fileSystem);
+      request.run("systemctl --user daemon-reload");
+      request.run(`systemctl --user enable ${request.timerUnit}`);
+      enabledByAttempt = true;
+      request.run(`systemctl --user start ${request.timerUnit}`);
+    } catch (error45) {
+      if (!wasActive)
+        bestEffort(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" }));
+      if (enabledByAttempt)
+        bestEffort(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" }));
+      bestEffort(() => restoreFile(serviceSnapshot, fileSystem));
+      bestEffort(() => restoreFile(timerSnapshot, fileSystem));
+      bestEffort(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" }));
+      bestEffort(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState));
+      if (wasActive)
+        bestEffort(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" }));
+      throw error45;
+    }
+  } finally {
+    releaseLock();
   }
 }
 
@@ -13436,6 +13571,7 @@ function installSystemdJob(job, run = defaultSystemdCommandRunner) {
   const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1);
   installSystemdUnits({
     unitDir: SYSTEMD_USER_DIR,
+    lockDir: join2(SCHEDULER_DIR, "systemd-install-locks"),
     serviceUnit,
     timerUnit,
     serviceContent: createSystemdService(job),
@@ -13823,7 +13959,7 @@ function removePaths(paths, errors3) {
     if (!existsSync2(path))
       continue;
     try {
-      rmSync(path, { recursive: true, force: true });
+      rmSync2(path, { recursive: true, force: true });
       removed.push(path);
     } catch (error45) {
       const msg = error45 instanceof Error ? error45.message : String(error45);
