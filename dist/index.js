@@ -12335,30 +12335,258 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // src/index.ts
-import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
-import { basename, dirname, join, resolve as resolvePath } from "path";
+import { createWriteStream, existsSync as existsSync2, mkdirSync as mkdirSync2, readdirSync, readFileSync as readFileSync2, rmSync, writeFileSync as writeFileSync2, unlinkSync as unlinkSync2 } from "fs";
+import { basename, dirname, join as join2, resolve as resolvePath } from "path";
 import { homedir, platform } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
 import { fileURLToPath } from "url";
-var OPENCODE_CONFIG = join(homedir(), ".config", "opencode");
-var LEGACY_JOBS_DIR = join(OPENCODE_CONFIG, "jobs");
-var LOGS_DIR = join(OPENCODE_CONFIG, "logs");
-var SCHEDULER_DIR = join(OPENCODE_CONFIG, "scheduler");
-var SCOPES_DIR = join(SCHEDULER_DIR, "scopes");
-var SUPERVISOR_PATH = join(SCHEDULER_DIR, "supervisor.pl");
-var SCHEDULER_CONFIG = join(OPENCODE_CONFIG, "opencode-scheduler.json");
+
+// src/cron.ts
+var SYSTEMD_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function splitCronExpression(cron) {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 5) {
+    throw new Error(`Invalid cron: ${cron}`);
+  }
+  return parts;
+}
+function uniqueSorted(values) {
+  return Array.from(new Set(values)).sort((a, b) => a - b);
+}
+function parseCronField(field, min, max, label, allowSundaySeven = false) {
+  if (field === "*")
+    return null;
+  if (field.startsWith("*/")) {
+    const step = parseInt(field.slice(2), 10);
+    if (!Number.isFinite(step) || step <= 0) {
+      throw new Error(`Invalid cron ${label} step: ${field}`);
+    }
+    const values = [];
+    for (let value = min;value <= max; value += step)
+      values.push(value);
+    return values;
+  }
+  const parts = field.split(",");
+  if (parts.length > 1) {
+    return uniqueSorted(parts.map((part) => parseCronNumber(part, min, max, label, allowSundaySeven)));
+  }
+  if (/^\d+$/.test(field)) {
+    return [parseCronNumber(field, min, max, label, allowSundaySeven)];
+  }
+  throw new Error(`Invalid cron ${label} field: ${field}`);
+}
+function parseCronNumber(value, min, max, label, allowSundaySeven) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed))
+    throw new Error(`Invalid cron ${label} value: ${value}`);
+  const normalized = allowSundaySeven && parsed === 7 ? 0 : parsed;
+  if (normalized < min || normalized > max)
+    throw new Error(`Invalid cron ${label} value: ${value}`);
+  return normalized;
+}
+function validateCronExpression(cron) {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron);
+  parseCronField(minute, 0, 59, "minute");
+  parseCronField(hour, 0, 23, "hour");
+  parseCronField(dayOfMonth, 1, 31, "day of month");
+  parseCronField(month, 1, 12, "month");
+  parseCronField(dayOfWeek, 0, 7, "day of week", true);
+}
+function formatSystemdValue(value, size) {
+  return value.toString().padStart(size, "0");
+}
+function cronToSystemdCalendars(cron) {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron);
+  const minuteValues = parseCronField(minute, 0, 59, "minute");
+  const hourValues = parseCronField(hour, 0, 23, "hour");
+  const dayValues = parseCronField(dayOfMonth, 1, 31, "day of month");
+  const monthValues = parseCronField(month, 1, 12, "month");
+  const weekdayValues = parseCronField(dayOfWeek, 0, 7, "day of week", true);
+  const minutes = minuteValues ? minuteValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
+  const hours = hourValues ? hourValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
+  const days = dayValues ? dayValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
+  const months = monthValues ? monthValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
+  const weekdays = weekdayValues ? weekdayValues.map((value) => SYSTEMD_WEEKDAYS[value] ?? "*") : ["*"];
+  const calendars = [];
+  const buildCalendars = (domValues, dowValues) => {
+    for (const minuteValue of minutes) {
+      for (const hourValue of hours) {
+        for (const domValue of domValues) {
+          for (const monthValue of months) {
+            for (const dowValue of dowValues) {
+              const weekdayPrefix = dowValue === "*" ? "" : `${dowValue} `;
+              calendars.push(`${weekdayPrefix}*-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`);
+            }
+          }
+        }
+      }
+    }
+  };
+  if (dayValues && weekdayValues) {
+    buildCalendars(days, ["*"]);
+    buildCalendars(["*"], weekdays);
+  } else {
+    buildCalendars(days, weekdays);
+  }
+  return calendars;
+}
+
+// src/systemd.ts
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from "fs";
+import { join } from "path";
+var defaultRuntimeEnvDependencies = {
+  exists: existsSync,
+  uid: () => process.getuid?.()
+};
+function withSystemdRuntimeEnv(env, dependencies = defaultRuntimeEnvDependencies) {
+  const next = { ...env };
+  if (!next.XDG_RUNTIME_DIR) {
+    const uid = dependencies.uid();
+    if (typeof uid === "number") {
+      const runtimeDir = `/run/user/${uid}`;
+      if (dependencies.exists(runtimeDir))
+        next.XDG_RUNTIME_DIR = runtimeDir;
+    }
+  }
+  if (!next.DBUS_SESSION_BUS_ADDRESS && next.XDG_RUNTIME_DIR) {
+    const busPath = join(next.XDG_RUNTIME_DIR, "bus");
+    if (dependencies.exists(busPath))
+      next.DBUS_SESSION_BUS_ADDRESS = `unix:path=${busPath}`;
+  }
+  return next;
+}
+var defaultFileSystem = {
+  chmod: chmodSync,
+  exists: existsSync,
+  mkdir: mkdirSync,
+  readFile: readFileSync,
+  rename: renameSync,
+  stat: statSync,
+  unlink: unlinkSync,
+  writeFile: writeFileSync
+};
+function snapshotFile(path, fileSystem) {
+  if (!fileSystem.exists(path))
+    return { path, existed: false };
+  return {
+    path,
+    existed: true,
+    content: fileSystem.readFile(path),
+    mode: fileSystem.stat(path).mode & 511
+  };
+}
+var temporaryFileSequence = 0;
+function atomicReplace(path, content, mode, fileSystem) {
+  temporaryFileSequence += 1;
+  const temporaryPath = `${path}.tmp-${process.pid}-${temporaryFileSequence}`;
+  try {
+    fileSystem.writeFile(temporaryPath, content, { mode });
+    fileSystem.chmod(temporaryPath, mode);
+    fileSystem.rename(temporaryPath, path);
+    fileSystem.chmod(path, mode);
+  } finally {
+    try {
+      fileSystem.unlink(temporaryPath);
+    } catch {}
+  }
+}
+function commandOutput(value) {
+  if (Buffer.isBuffer(value))
+    return value.toString().trim();
+  if (typeof value === "string")
+    return value.trim();
+  if (typeof value === "object" && value !== null && "stdout" in value) {
+    const stdout = value.stdout;
+    if (Buffer.isBuffer(stdout))
+      return stdout.toString().trim();
+    if (typeof stdout === "string")
+      return stdout.trim();
+  }
+  return "";
+}
+function queryTimerState(run, timerUnit, query) {
+  let output = "";
+  try {
+    output = commandOutput(run(`systemctl --user ${query} ${timerUnit}`, { stdio: ["ignore", "pipe", "ignore"] }));
+  } catch (error45) {
+    output = commandOutput(error45);
+  }
+  return query === "is-enabled" ? ["enabled", "enabled-runtime", "linked", "linked-runtime", "alias"].includes(output) : ["active", "activating", "reloading"].includes(output);
+}
+function restoreFile(snapshot, fileSystem) {
+  if (!snapshot.existed) {
+    try {
+      fileSystem.unlink(snapshot.path);
+    } catch {}
+    return;
+  }
+  atomicReplace(snapshot.path, snapshot.content ?? Buffer.alloc(0), snapshot.mode ?? 420, fileSystem);
+}
+function bestEffort(action) {
+  try {
+    action();
+  } catch {}
+}
+function installSystemdUnits(request) {
+  const fileSystem = request.fileSystem ?? defaultFileSystem;
+  fileSystem.mkdir(request.unitDir, { recursive: true });
+  const servicePath = join(request.unitDir, request.serviceUnit);
+  const timerPath = join(request.unitDir, request.timerUnit);
+  const serviceSnapshot = snapshotFile(servicePath, fileSystem);
+  const timerSnapshot = snapshotFile(timerPath, fileSystem);
+  const wasEnabled = queryTimerState(request.run, request.timerUnit, "is-enabled");
+  const wasActive = queryTimerState(request.run, request.timerUnit, "is-active");
+  try {
+    atomicReplace(servicePath, request.serviceContent, 420, fileSystem);
+    atomicReplace(timerPath, request.timerContent, 420, fileSystem);
+    request.run("systemctl --user daemon-reload");
+    request.run(`systemctl --user enable ${request.timerUnit}`);
+    request.run(`systemctl --user start ${request.timerUnit}`);
+  } catch (error45) {
+    if (!wasActive)
+      bestEffort(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" }));
+    if (!wasEnabled)
+      bestEffort(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" }));
+    bestEffort(() => restoreFile(serviceSnapshot, fileSystem));
+    bestEffort(() => restoreFile(timerSnapshot, fileSystem));
+    bestEffort(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" }));
+    if (wasEnabled)
+      bestEffort(() => request.run(`systemctl --user enable ${request.timerUnit}`, { stdio: "ignore" }));
+    if (wasActive)
+      bestEffort(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" }));
+    throw error45;
+  }
+}
+
+// src/index.ts
+var OPENCODE_CONFIG = join2(homedir(), ".config", "opencode");
+var LEGACY_JOBS_DIR = join2(OPENCODE_CONFIG, "jobs");
+var LOGS_DIR = join2(OPENCODE_CONFIG, "logs");
+var SCHEDULER_DIR = join2(OPENCODE_CONFIG, "scheduler");
+var SCOPES_DIR = join2(SCHEDULER_DIR, "scopes");
+var SUPERVISOR_PATH = join2(SCHEDULER_DIR, "supervisor.pl");
+var SCHEDULER_CONFIG = join2(OPENCODE_CONFIG, "opencode-scheduler.json");
 var IS_MAC = platform() === "darwin";
 var IS_LINUX = platform() === "linux";
 var IS_WINDOWS = platform() === "win32";
-var LAUNCH_AGENTS_DIR = join(homedir(), "Library", "LaunchAgents");
+var LAUNCH_AGENTS_DIR = join2(homedir(), "Library", "LaunchAgents");
 var LAUNCHD_PREFIX = "com.opencode.job";
-var SYSTEMD_USER_DIR = join(homedir(), ".config", "systemd", "user");
+var SYSTEMD_USER_DIR = join2(homedir(), ".config", "systemd", "user");
 var WINDOWS_TASK_ROOT = "\\OpenCode";
 var WINDOWS_TASK_PREFIX = "opencode-job";
 var CRON_MANAGED_PREFIX = "opencode-scheduler";
 function ensureDir(dir) {
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
+  if (!existsSync2(dir)) {
+    mkdirSync2(dir, { recursive: true });
   }
 }
 function slugify(name) {
@@ -12390,25 +12618,25 @@ function deriveScopeId(workdir) {
   return `${base}-${suffix}`;
 }
 function scopeDir(scopeId) {
-  return join(SCOPES_DIR, scopeId);
+  return join2(SCOPES_DIR, scopeId);
 }
 function scopeJobsDir(scopeId) {
-  return join(scopeDir(scopeId), "jobs");
+  return join2(scopeDir(scopeId), "jobs");
 }
 function scopeLocksDir(scopeId) {
-  return join(scopeDir(scopeId), "locks");
+  return join2(scopeDir(scopeId), "locks");
 }
 function scopeRunsDir(scopeId) {
-  return join(scopeDir(scopeId), "runs");
+  return join2(scopeDir(scopeId), "runs");
 }
 function scopeLogsDir(scopeId) {
-  return join(LOGS_DIR, "scheduler", scopeId);
+  return join2(LOGS_DIR, "scheduler", scopeId);
 }
 function jobFilePath(scopeId, slug) {
-  return join(scopeJobsDir(scopeId), `${slug}.json`);
+  return join2(scopeJobsDir(scopeId), `${slug}.json`);
 }
 function scopedLogPath(scopeId, slug) {
-  return join(scopeLogsDir(scopeId), `${slug}.log`);
+  return join2(scopeLogsDir(scopeId), `${slug}.log`);
 }
 function currentScopeId() {
   return deriveScopeId(process.cwd());
@@ -12667,7 +12895,7 @@ exit($exit_code);
 `;
 function ensureSupervisorScript() {
   ensureDir(SCHEDULER_DIR);
-  writeFileSync(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
+  writeFileSync2(SUPERVISOR_PATH, SUPERVISOR_SCRIPT);
 }
 function normalizeFormat(format) {
   return format === "json" ? "json" : "text";
@@ -12795,19 +13023,19 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
   if (!installRoot) {
     throw new Error("Install directory cannot be empty.");
   }
-  if (!existsSync(installRoot)) {
+  if (!existsSync2(installRoot)) {
     throw new Error(`Directory not found: ${installRoot}`);
   }
   const relativeDir = dirname(skill.suggestedPath);
-  const installDir = join(installRoot, relativeDir);
+  const installDir = join2(installRoot, relativeDir);
   ensureDir(installDir);
   const files = [];
   for (const [filename, content] of Object.entries(skill.files)) {
-    const targetPath = join(installDir, filename);
-    if (existsSync(targetPath) && !overwrite) {
+    const targetPath = join2(installDir, filename);
+    if (existsSync2(targetPath) && !overwrite) {
       throw new Error(`File already exists: ${targetPath} (pass overwrite=true to replace)`);
     }
-    writeFileSync(targetPath, `${content.trimEnd()}
+    writeFileSync2(targetPath, `${content.trimEnd()}
 `);
     files.push(targetPath);
   }
@@ -12816,8 +13044,8 @@ function installBuiltinSkill(skill, rootDir, overwrite = false) {
 function loadPackageInfo() {
   const fallback = { name: "opencode-scheduler", version: "unknown" };
   try {
-    const packagePath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-    const raw = readFileSync(packagePath, "utf-8");
+    const packagePath = join2(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const raw = readFileSync2(packagePath, "utf-8");
     const parsed = JSON.parse(raw);
     return {
       name: typeof parsed.name === "string" ? parsed.name : fallback.name,
@@ -12845,10 +13073,10 @@ function findOpencode() {
   const paths = [
     "/opt/homebrew/bin/opencode",
     "/usr/local/bin/opencode",
-    join(homedir(), ".opencode", "bin", "opencode")
+    join2(homedir(), ".opencode", "bin", "opencode")
   ];
   for (const p of paths) {
-    if (existsSync(p)) {
+    if (existsSync2(p)) {
       return p;
     }
   }
@@ -12864,59 +13092,6 @@ function getEnhancedPath() {
     "/sbin"
   ];
   return paths.join(":");
-}
-function splitCronExpression(cron) {
-  const parts = cron.trim().split(/\s+/);
-  if (parts.length !== 5) {
-    throw new Error(`Invalid cron: ${cron}`);
-  }
-  return parts;
-}
-function uniqueSorted(values) {
-  return Array.from(new Set(values)).sort((a, b) => a - b);
-}
-function parseCronField(field, min, max, label, allowSundaySeven = false) {
-  if (field === "*")
-    return null;
-  if (field.startsWith("*/")) {
-    const step = parseInt(field.slice(2), 10);
-    if (!Number.isFinite(step) || step <= 0) {
-      throw new Error(`Invalid cron ${label} step: ${field}`);
-    }
-    const values = [];
-    for (let value = min;value <= max; value += step) {
-      values.push(value);
-    }
-    return values;
-  }
-  const parts = field.split(",");
-  if (parts.length > 1) {
-    const values = parts.map((part) => parseCronNumber(part, min, max, label, allowSundaySeven));
-    return uniqueSorted(values);
-  }
-  if (/^\d+$/.test(field)) {
-    return [parseCronNumber(field, min, max, label, allowSundaySeven)];
-  }
-  throw new Error(`Invalid cron ${label} field: ${field}`);
-}
-function parseCronNumber(value, min, max, label, allowSundaySeven) {
-  const parsed = parseInt(value, 10);
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`Invalid cron ${label} value: ${value}`);
-  }
-  const normalized = allowSundaySeven && parsed === 7 ? 0 : parsed;
-  if (normalized < min || normalized > max) {
-    throw new Error(`Invalid cron ${label} value: ${value}`);
-  }
-  return normalized;
-}
-function validateCronExpression(cron) {
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron);
-  parseCronField(minute, 0, 59, "minute");
-  parseCronField(hour, 0, 23, "hour");
-  parseCronField(dayOfMonth, 1, 31, "day of month");
-  parseCronField(month, 1, 12, "month");
-  parseCronField(dayOfWeek, 0, 7, "day of week", true);
 }
 function expandLaunchdEntries(entries, key, values) {
   if (!values)
@@ -12963,45 +13138,6 @@ function renderLaunchdCalendar(calendar) {
   return Object.entries(calendar).map(([key, value]) => `    <key>${key}</key>
     <integer>${value}</integer>`).join(`
 `);
-}
-var SYSTEMD_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-function formatSystemdValue(value, size) {
-  return value.toString().padStart(size, "0");
-}
-function cronToSystemdCalendars(cron) {
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron);
-  const minuteValues = parseCronField(minute, 0, 59, "minute");
-  const hourValues = parseCronField(hour, 0, 23, "hour");
-  const dayValues = parseCronField(dayOfMonth, 1, 31, "day of month");
-  const monthValues = parseCronField(month, 1, 12, "month");
-  const weekdayValues = parseCronField(dayOfWeek, 0, 7, "day of week", true);
-  const minutes = minuteValues ? minuteValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
-  const hours = hourValues ? hourValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
-  const days = dayValues ? dayValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
-  const months = monthValues ? monthValues.map((value) => formatSystemdValue(value, 2)) : ["*"];
-  const weekdays = weekdayValues ? weekdayValues.map((value) => SYSTEMD_WEEKDAYS[value] ?? "*") : ["*"];
-  const calendars = [];
-  const buildCalendars = (domValues, dowValues) => {
-    for (const minuteValue of minutes) {
-      for (const hourValue of hours) {
-        for (const domValue of domValues) {
-          for (const monthValue of months) {
-            for (const dowValue of dowValues) {
-              const weekdayPrefix = dowValue === "*" ? "" : `${dowValue} `;
-              calendars.push(`${weekdayPrefix}*-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`);
-            }
-          }
-        }
-      }
-    }
-  };
-  if (dayValues && weekdayValues) {
-    buildCalendars(days, ["*"]);
-    buildCalendars(["*"], weekdays);
-  } else {
-    buildCalendars(days, weekdays);
-  }
-  return calendars;
 }
 var WINDOWS_WEEKDAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 var WINDOWS_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
@@ -13193,56 +13329,37 @@ function installLaunchdJob(job) {
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   const label = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const plistPath = join(LAUNCH_AGENTS_DIR, `${label}.plist`);
+  const plistPath = join2(LAUNCH_AGENTS_DIR, `${label}.plist`);
   try {
     execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: "ignore" });
   } catch {}
-  if (existsSync(legacyPlistPath)) {
+  if (existsSync2(legacyPlistPath)) {
     try {
       execSync(`launchctl unload "${legacyPlistPath}" 2>/dev/null`, { stdio: "ignore" });
     } catch {}
   }
   const plist = createLaunchdPlist(job);
-  writeFileSync(plistPath, plist);
+  writeFileSync2(plistPath, plist);
   execSync(`launchctl load "${plistPath}"`);
 }
 function uninstallLaunchdJob(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   const scopedLabel = `${LAUNCHD_PREFIX}.${scopeId}.${job.slug}`;
-  const scopedPlistPath = join(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
+  const scopedPlistPath = join2(LAUNCH_AGENTS_DIR, `${scopedLabel}.plist`);
   const legacyLabel = `${LAUNCHD_PREFIX}.${job.slug}`;
-  const legacyPlistPath = join(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
+  const legacyPlistPath = join2(LAUNCH_AGENTS_DIR, `${legacyLabel}.plist`);
   for (const plistPath of [scopedPlistPath, legacyPlistPath]) {
-    if (!existsSync(plistPath))
+    if (!existsSync2(plistPath))
       continue;
     try {
       execSync(`launchctl unload "${plistPath}"`, { stdio: "ignore" });
     } catch {}
     try {
-      unlinkSync(plistPath);
+      unlinkSync2(plistPath);
     } catch {}
   }
-}
-function withSystemdRuntimeEnv(env) {
-  const next = { ...env };
-  if (!next.XDG_RUNTIME_DIR) {
-    const uid = process.getuid?.();
-    if (typeof uid === "number") {
-      const runtimeDir = `/run/user/${uid}`;
-      if (existsSync(runtimeDir)) {
-        next.XDG_RUNTIME_DIR = runtimeDir;
-      }
-    }
-  }
-  if (!next.DBUS_SESSION_BUS_ADDRESS && next.XDG_RUNTIME_DIR) {
-    const busPath = join(next.XDG_RUNTIME_DIR, "bus");
-    if (existsSync(busPath)) {
-      next.DBUS_SESSION_BUS_ADDRESS = `unix:path=${busPath}`;
-    }
-  }
-  return next;
 }
 function systemdRunEnv() {
   const enhancedPath = getEnhancedPath();
@@ -13255,9 +13372,8 @@ function systemdRunEnv() {
 function defaultSystemdCommandRunner(command, options) {
   return execSync(command, { ...options, env: systemdRunEnv() });
 }
-var systemdCommandRunner = defaultSystemdCommandRunner;
 function systemdExecSync(command, options) {
-  return systemdCommandRunner(command, options);
+  return defaultSystemdCommandRunner(command, options);
 }
 function createSystemdService(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
@@ -13296,37 +13412,24 @@ Persistent=true
 WantedBy=timers.target
 `;
 }
-function installSystemdJob(job) {
+function installSystemdJob(job, run = defaultSystemdCommandRunner) {
   ensureDir(SYSTEMD_USER_DIR);
   ensureDir(LOGS_DIR);
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   ensureDir(scopeLogsDir(scopeId));
   ensureSupervisorScript();
-  const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
-  try {
-    systemdExecSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" });
-    systemdExecSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" });
-  } catch {}
-  writeFileSync(servicePath, createSystemdService(job), { mode: 420 });
-  writeFileSync(timerPath, createSystemdTimer(job), { mode: 420 });
-  chmodSync(servicePath, 420);
-  chmodSync(timerPath, 420);
-  try {
-    systemdExecSync("systemctl --user daemon-reload");
-    systemdExecSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`);
-    systemdExecSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`);
-  } catch (error45) {
-    for (const unitPath of [timerPath, servicePath]) {
-      try {
-        unlinkSync(unitPath);
-      } catch {}
-    }
-    try {
-      systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" });
-    } catch {}
-    throw error45;
-  }
+  const servicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const timerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1);
+  const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1);
+  installSystemdUnits({
+    unitDir: SYSTEMD_USER_DIR,
+    serviceUnit,
+    timerUnit,
+    serviceContent: createSystemdService(job),
+    timerContent: createSystemdTimer(job),
+    run
+  });
 }
 function uninstallSystemdJob(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
@@ -13338,14 +13441,14 @@ function uninstallSystemdJob(job) {
       systemdExecSync(`systemctl --user disable ${timerUnit}`, { stdio: "ignore" });
     } catch {}
   }
-  const scopedServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
-  const scopedTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
-  const legacyServicePath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
-  const legacyTimerPath = join(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
+  const scopedServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`);
+  const scopedTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
+  const legacyServicePath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.service`);
+  const legacyTimerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${job.slug}.timer`);
   for (const p of [scopedServicePath, scopedTimerPath, legacyServicePath, legacyTimerPath]) {
-    if (existsSync(p)) {
+    if (existsSync2(p)) {
       try {
-        unlinkSync(p);
+        unlinkSync2(p);
       } catch {}
     }
   }
@@ -13577,10 +13680,10 @@ function ensureScopeStorage(scopeId) {
 function loadScopedJob(scopeId, slug) {
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, slug);
-  if (!existsSync(path))
+  if (!existsSync2(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync2(path, "utf-8")));
   } catch {
     return null;
   }
@@ -13590,7 +13693,7 @@ function loadAllScopedJobs(scopeId) {
   const files = readdirSync(scopeJobsDir(scopeId)).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync(join(scopeJobsDir(scopeId), f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync2(join2(scopeJobsDir(scopeId), f), "utf-8")));
     } catch {
       return null;
     }
@@ -13601,7 +13704,7 @@ function listScopeIds() {
   try {
     return readdirSync(SCOPES_DIR).filter((name) => {
       try {
-        return existsSync(scopeDir(name));
+        return existsSync2(scopeDir(name));
       } catch {
         return false;
       }
@@ -13620,11 +13723,11 @@ function loadAllJobsAcrossScopes() {
 }
 function loadLegacyJob(slug) {
   ensureDir(LEGACY_JOBS_DIR);
-  const path = join(LEGACY_JOBS_DIR, `${slug}.json`);
-  if (!existsSync(path))
+  const path = join2(LEGACY_JOBS_DIR, `${slug}.json`);
+  if (!existsSync2(path))
     return null;
   try {
-    return normalizeJob(JSON.parse(readFileSync(path, "utf-8")));
+    return normalizeJob(JSON.parse(readFileSync2(path, "utf-8")));
   } catch {
     return null;
   }
@@ -13634,7 +13737,7 @@ function loadAllLegacyJobs() {
   const files = readdirSync(LEGACY_JOBS_DIR).filter((f) => f.endsWith(".json"));
   return files.map((f) => {
     try {
-      return normalizeJob(JSON.parse(readFileSync(join(LEGACY_JOBS_DIR, f), "utf-8")));
+      return normalizeJob(JSON.parse(readFileSync2(join2(LEGACY_JOBS_DIR, f), "utf-8")));
     } catch {
       return null;
     }
@@ -13645,27 +13748,27 @@ function saveJob(job) {
   const normalizedJob = { ...job, scopeId };
   ensureScopeStorage(scopeId);
   const path = jobFilePath(scopeId, normalizedJob.slug);
-  writeFileSync(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2));
+  writeFileSync2(path, JSON.stringify(sanitizeJob(normalizedJob), null, 2));
 }
 function deleteJobFile(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   const path = jobFilePath(scopeId, job.slug);
-  if (existsSync(path)) {
-    unlinkSync(path);
+  if (existsSync2(path)) {
+    unlinkSync2(path);
   }
 }
 function listDirectoryFiles(dir, options) {
-  if (!existsSync(dir))
+  if (!existsSync2(dir))
     return [];
   try {
     const entries = readdirSync(dir, { withFileTypes: true });
-    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join(dir, name)).sort();
+    return entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => options?.prefix ? name.startsWith(options.prefix) : true).filter((name) => options?.suffix ? name.endsWith(options.suffix) : true).map((name) => join2(dir, name)).sort();
   } catch {
     return [];
   }
 }
 function listDirectoryNames(dir) {
-  if (!existsSync(dir))
+  if (!existsSync2(dir))
     return [];
   try {
     return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
@@ -13681,9 +13784,9 @@ function buildGlobalCleanupPlan(includeHistory) {
   const scopedJobDefinitionPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeJobsDir(scopeId), { suffix: ".json" }));
   const lockPaths = scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeLocksDir(scopeId), { suffix: ".json" }));
   const runHistoryPaths = includeHistory ? scopeIds.flatMap((scopeId) => listDirectoryFiles(scopeRunsDir(scopeId), { suffix: ".jsonl" })) : [];
-  const schedulerLogsRoot = join(LOGS_DIR, "scheduler");
+  const schedulerLogsRoot = join2(LOGS_DIR, "scheduler");
   const logScopeIds = listDirectoryNames(schedulerLogsRoot);
-  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
+  const logPaths = includeHistory ? logScopeIds.flatMap((scopeId) => listDirectoryFiles(join2(schedulerLogsRoot, scopeId), { suffix: ".log" })) : [];
   const launchdPaths = IS_MAC ? listDirectoryFiles(LAUNCH_AGENTS_DIR, { prefix: `${LAUNCHD_PREFIX}.`, suffix: ".plist" }) : [];
   const systemdPaths = IS_LINUX ? [
     ...listDirectoryFiles(SYSTEMD_USER_DIR, { prefix: "opencode-job-", suffix: ".service" }),
@@ -13705,7 +13808,7 @@ function buildGlobalCleanupPlan(includeHistory) {
 function removePaths(paths, errors3) {
   const removed = [];
   for (const path of uniquePaths(paths)) {
-    if (!existsSync(path))
+    if (!existsSync2(path))
       continue;
     try {
       rmSync(path, { recursive: true, force: true });
@@ -13732,7 +13835,7 @@ function executeGlobalCleanup(plan, options) {
   }
   const removeOrPreview = (paths) => {
     if (dryRun)
-      return uniquePaths(paths).filter((path) => existsSync(path));
+      return uniquePaths(paths).filter((path) => existsSync2(path));
     return removePaths(paths, errors3);
   };
   const removed = {
@@ -14178,10 +14281,10 @@ function buildRunEnvironment() {
   };
 }
 function loadSchedulerConfig() {
-  if (!existsSync(SCHEDULER_CONFIG))
+  if (!existsSync2(SCHEDULER_CONFIG))
     return {};
   try {
-    const raw = readFileSync(SCHEDULER_CONFIG, "utf-8");
+    const raw = readFileSync2(SCHEDULER_CONFIG, "utf-8");
     const parsed = JSON.parse(raw);
     if (!isRecord(parsed))
       return {};
@@ -14382,7 +14485,7 @@ function formatJobDetails(job) {
 }
 function getJobLogs(job, options) {
   const logPath = getLogPath(job);
-  if (!existsSync(logPath))
+  if (!existsSync2(logPath))
     return null;
   const maxChars = options?.maxChars ?? 5000;
   const tailLines = options?.tailLines;
@@ -14395,14 +14498,14 @@ function getJobLogs(job, options) {
         }).toString();
         return output.length > maxChars ? output.slice(-maxChars) : output;
       } catch {
-        const content2 = readFileSync(logPath, "utf-8");
+        const content2 = readFileSync2(logPath, "utf-8");
         const lines = content2.split(/\r?\n/);
         const output = lines.slice(-clampedLines).join(`
 `);
         return output.length > maxChars ? output.slice(-maxChars) : output;
       }
     }
-    const content = readFileSync(logPath, "utf-8");
+    const content = readFileSync2(logPath, "utf-8");
     return content.length > maxChars ? content.slice(-maxChars) : content;
   } catch {
     return null;
@@ -14830,9 +14933,9 @@ ${content.trim()}
             installJob(updatedJob);
             if (scopeChanged) {
               const oldPath = jobFilePath(oldScopeId, job.slug);
-              if (existsSync(oldPath)) {
+              if (existsSync2(oldPath)) {
                 try {
-                  unlinkSync(oldPath);
+                  unlinkSync2(oldPath);
                 } catch {}
               }
             }
@@ -14861,10 +14964,10 @@ ${content.trim()}
           }
           uninstallJob(job);
           deleteJobFile(job);
-          const legacyPath = join(LEGACY_JOBS_DIR, `${job.slug}.json`);
-          if (existsSync(legacyPath)) {
+          const legacyPath = join2(LEGACY_JOBS_DIR, `${job.slug}.json`);
+          if (existsSync2(legacyPath)) {
             try {
-              unlinkSync(legacyPath);
+              unlinkSync2(legacyPath);
             } catch {}
           }
           return okResult(format, `Deleted job "${job.name}"`, { job });
@@ -15019,24 +15122,6 @@ ${logs}`, { job, logPath, logs });
   };
 };
 var src_default = SchedulerPlugin;
-Object.assign(SchedulerPlugin, {
-  __test__: {
-    cronToSystemdCalendars,
-    createSystemdTimer,
-    withSystemdRuntimeEnv,
-    systemdRunEnv,
-    installSystemdJob,
-    uninstallSystemdJob,
-    saveJob,
-    deleteJobFile,
-    jobFilePath,
-    SYSTEMD_USER_DIR,
-    SCOPES_DIR,
-    setSystemdCommandRunner(runner) {
-      systemdCommandRunner = runner ?? defaultSystemdCommandRunner;
-    }
-  }
-});
 export {
   src_default as default,
   SchedulerPlugin

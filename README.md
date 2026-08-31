@@ -96,6 +96,7 @@ Jobs run from the working directory where you created them, picking up your `ope
 - **No overlap**: if the previous run is still active, the next scheduled tick is skipped.
 - **Non-interactive by default**: scheduled runs force `OPENCODE_PERMISSION` to deny "question" prompts, so jobs don't hang waiting for approvals.
 - **Optional timeout**: set `timeoutSeconds` to hard-stop long runs (SIGTERM, then SIGKILL).
+- **Transactional systemd updates**: Linux unit installation restores the prior unit files, permissions, enabled state, and active state if any install step fails.
 
 ### Platform Support
 

@@ -13,11 +13,13 @@
  */
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
 import { homedir, platform } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
+import { cronToSystemdCalendars, parseCronField, splitCronExpression, validateCronExpression } from "./cron"
+import { installSystemdUnits, type SystemdCommandRunner, withSystemdRuntimeEnv } from "./systemd"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -672,78 +674,6 @@ function getEnhancedPath(): string {
   return paths.join(":")
 }
 
-function splitCronExpression(cron: string): [string, string, string, string, string] {
-  const parts = cron.trim().split(/\s+/)
-  if (parts.length !== 5) {
-    throw new Error(`Invalid cron: ${cron}`)
-  }
-  return parts as [string, string, string, string, string]
-}
-
-function uniqueSorted(values: number[]): number[] {
-  return Array.from(new Set(values)).sort((a, b) => a - b)
-}
-
-function parseCronField(
-  field: string,
-  min: number,
-  max: number,
-  label: string,
-  allowSundaySeven = false
-): number[] | null {
-  if (field === "*") return null
-
-  if (field.startsWith("*/")) {
-    const step = parseInt(field.slice(2), 10)
-    if (!Number.isFinite(step) || step <= 0) {
-      throw new Error(`Invalid cron ${label} step: ${field}`)
-    }
-    const values: number[] = []
-    for (let value = min; value <= max; value += step) {
-      values.push(value)
-    }
-    return values
-  }
-
-  const parts = field.split(",")
-  if (parts.length > 1) {
-    const values = parts.map((part) => parseCronNumber(part, min, max, label, allowSundaySeven))
-    return uniqueSorted(values)
-  }
-
-  if (/^\d+$/.test(field)) {
-    return [parseCronNumber(field, min, max, label, allowSundaySeven)]
-  }
-
-  throw new Error(`Invalid cron ${label} field: ${field}`)
-}
-
-function parseCronNumber(
-  value: string,
-  min: number,
-  max: number,
-  label: string,
-  allowSundaySeven: boolean
-): number {
-  const parsed = parseInt(value, 10)
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`Invalid cron ${label} value: ${value}`)
-  }
-  const normalized = allowSundaySeven && parsed === 7 ? 0 : parsed
-  if (normalized < min || normalized > max) {
-    throw new Error(`Invalid cron ${label} value: ${value}`)
-  }
-  return normalized
-}
-
-function validateCronExpression(cron: string): void {
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
-  parseCronField(minute, 0, 59, "minute")
-  parseCronField(hour, 0, 23, "hour")
-  parseCronField(dayOfMonth, 1, 31, "day of month")
-  parseCronField(month, 1, 12, "month")
-  parseCronField(dayOfWeek, 0, 7, "day of week", true)
-}
 
 function expandLaunchdEntries(
   entries: Record<string, number>[],
@@ -808,58 +738,6 @@ function renderLaunchdCalendar(calendar: Record<string, number>): string {
     .join("\n")
 }
 
-const SYSTEMD_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-
-function formatSystemdValue(value: number, size: number): string {
-  return value.toString().padStart(size, "0")
-}
-
-function cronToSystemdCalendars(cron: string): string[] {
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = splitCronExpression(cron)
-  const minuteValues = parseCronField(minute, 0, 59, "minute")
-  const hourValues = parseCronField(hour, 0, 23, "hour")
-  const dayValues = parseCronField(dayOfMonth, 1, 31, "day of month")
-  const monthValues = parseCronField(month, 1, 12, "month")
-  const weekdayValues = parseCronField(dayOfWeek, 0, 7, "day of week", true)
-
-  const minutes = minuteValues ? minuteValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const hours = hourValues ? hourValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const days = dayValues ? dayValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const months = monthValues ? monthValues.map((value) => formatSystemdValue(value, 2)) : ["*"]
-  const weekdays = weekdayValues
-    ? weekdayValues.map((value) => SYSTEMD_WEEKDAYS[value] ?? "*")
-    : ["*"]
-
-  const calendars: string[] = []
-
-  const buildCalendars = (domValues: string[], dowValues: string[]) => {
-    for (const minuteValue of minutes) {
-      for (const hourValue of hours) {
-        for (const domValue of domValues) {
-          for (const monthValue of months) {
-            for (const dowValue of dowValues) {
-              // systemd (see systemd.time(7)) does NOT accept "*" as a
-              // day-of-week prefix: "* *-09-06 10:00:00" fails to parse.
-              // Omit the weekday component entirely when it is a wildcard,
-              // producing the valid "y-m-d hh:mm:ss" form (year stays "*").
-              const weekdayPrefix = dowValue === "*" ? "" : `${dowValue} `
-              calendars.push(`${weekdayPrefix}*-${monthValue}-${domValue} ${hourValue}:${minuteValue}:00`)
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (dayValues && weekdayValues) {
-    buildCalendars(days, ["*"])
-    buildCalendars(["*"], weekdays)
-  } else {
-    buildCalendars(days, weekdays)
-  }
-
-  return calendars
-}
 
 const WINDOWS_WEEKDAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
 const WINDOWS_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -1164,29 +1042,6 @@ function uninstallLaunchdJob(job: Job): void {
 // real user manager socket exists. Derive it from the current uid's runtime
 // directory when present, and derive `DBUS_SESSION_BUS_ADDRESS` from it so the
 // user bus is reachable.
-function withSystemdRuntimeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const next: NodeJS.ProcessEnv = { ...env }
-
-  if (!next.XDG_RUNTIME_DIR) {
-    const uid = process.getuid?.()
-    if (typeof uid === "number") {
-      const runtimeDir = `/run/user/${uid}`
-      if (existsSync(runtimeDir)) {
-        next.XDG_RUNTIME_DIR = runtimeDir
-      }
-    }
-  }
-
-  if (!next.DBUS_SESSION_BUS_ADDRESS && next.XDG_RUNTIME_DIR) {
-    const busPath = join(next.XDG_RUNTIME_DIR, "bus")
-    if (existsSync(busPath)) {
-      next.DBUS_SESSION_BUS_ADDRESS = `unix:path=${busPath}`
-    }
-  }
-
-  return next
-}
-
 function systemdRunEnv(): NodeJS.ProcessEnv {
   const enhancedPath = getEnhancedPath()
   const existingPath = process.env.PATH
@@ -1196,25 +1051,15 @@ function systemdRunEnv(): NodeJS.ProcessEnv {
   })
 }
 
-type SystemdCommandRunner = (
-  command: string,
-  options?: Parameters<typeof execSync>[1]
-) => ReturnType<typeof execSync>
-
 function defaultSystemdCommandRunner(
   command: string,
   options?: Parameters<typeof execSync>[1]
-): ReturnType<typeof execSync> {
+): Buffer | string {
   return execSync(command, { ...options, env: systemdRunEnv() })
 }
 
-// Indirection kept as a unit-test seam so tests can stub systemctl without
-// shadowing the real binary (getEnhancedPath() always resolves /usr/bin
-// first). Production code never replaces it.
-let systemdCommandRunner: SystemdCommandRunner = defaultSystemdCommandRunner
-
-function systemdExecSync(command: string, options?: Parameters<typeof execSync>[1]): ReturnType<typeof execSync> {
-  return systemdCommandRunner(command, options)
+function systemdExecSync(command: string, options?: Parameters<typeof execSync>[1]): Buffer | string {
+  return defaultSystemdCommandRunner(command, options)
 }
 
 function createSystemdService(job: Job): string {
@@ -1260,7 +1105,7 @@ WantedBy=timers.target
 `
 }
 
-function installSystemdJob(job: Job): void {
+function installSystemdJob(job: Job, run: SystemdCommandRunner = defaultSystemdCommandRunner): void {
   ensureDir(SYSTEMD_USER_DIR)
   ensureDir(LOGS_DIR)
 
@@ -1271,40 +1116,16 @@ function installSystemdJob(job: Job): void {
   const servicePath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.service`)
   const timerPath = join(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`)
 
-  // Also stop/disable legacy units (pre-scope)
-  try {
-    systemdExecSync(`systemctl --user stop opencode-job-${job.slug}.timer`, { stdio: "ignore" })
-    systemdExecSync(`systemctl --user disable opencode-job-${job.slug}.timer`, { stdio: "ignore" })
-  } catch {}
-
-  // Write service and timer. Some environments (e.g. UGREEN NAS shells with a
-  // permissive umask) generate unit files with lax permissions that systemd
-  // rejects or warns about, so force 0644. writeFileSync `mode` only applies
-  // on file creation, hence the explicit chmod.
-  writeFileSync(servicePath, createSystemdService(job), { mode: 0o644 })
-  writeFileSync(timerPath, createSystemdTimer(job), { mode: 0o644 })
-  chmodSync(servicePath, 0o644)
-  chmodSync(timerPath, 0o644)
-
-  // Reload and enable. If any systemctl step fails we must not leave freshly
-  // written unit files behind: the job JSON has already been persisted by the
-  // caller (and gets removed when this error propagates), so orphaned units
-  // here would be the inverse orphan. Roll the units back before rethrowing.
-  try {
-    systemdExecSync("systemctl --user daemon-reload")
-    systemdExecSync(`systemctl --user enable opencode-job-${scopeId}-${job.slug}.timer`)
-    systemdExecSync(`systemctl --user start opencode-job-${scopeId}-${job.slug}.timer`)
-  } catch (error) {
-    for (const unitPath of [timerPath, servicePath]) {
-      try {
-        unlinkSync(unitPath)
-      } catch {}
-    }
-    try {
-      systemdExecSync("systemctl --user daemon-reload", { stdio: "ignore" })
-    } catch {}
-    throw error
-  }
+  const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1)
+  const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1)
+  installSystemdUnits({
+    unitDir: SYSTEMD_USER_DIR,
+    serviceUnit,
+    timerUnit,
+    serviceContent: createSystemdService(job),
+    timerContent: createSystemdTimer(job),
+    run,
+  })
 }
 
 function uninstallSystemdJob(job: Job): void {
@@ -3399,29 +3220,3 @@ Commands:
 
 // Default export for OpenCode plugin system
 export default SchedulerPlugin
-
-// Exported for the repo's unit tests (bun test). This is not part of the
-// plugin's public API; do not rely on it from consumer code.
-//
-// IMPORTANT: opencode's plugin loader treats EVERY module export as a plugin
-// factory and rejects non-function exports ("Plugin export is not a
-// function"), so test internals are attached as a property on the plugin
-// function instead of being exported as a separate binding.
-Object.assign(SchedulerPlugin, {
-  __test__: {
-    cronToSystemdCalendars,
-    createSystemdTimer,
-    withSystemdRuntimeEnv,
-    systemdRunEnv,
-    installSystemdJob,
-    uninstallSystemdJob,
-    saveJob,
-    deleteJobFile,
-    jobFilePath,
-    SYSTEMD_USER_DIR,
-    SCOPES_DIR,
-    setSystemdCommandRunner(runner: SystemdCommandRunner | null): void {
-      systemdCommandRunner = runner ?? defaultSystemdCommandRunner
-    },
-  },
-})
