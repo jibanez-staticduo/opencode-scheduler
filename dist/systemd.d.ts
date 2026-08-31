@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "fs";
 import type { ExecSyncOptions } from "child_process";
 export type SystemdCommandRunner = (command: string, options?: ExecSyncOptions) => Buffer | string;
 export interface RuntimeEnvDependencies {
@@ -8,21 +8,37 @@ export interface RuntimeEnvDependencies {
 export declare function withSystemdRuntimeEnv(env: NodeJS.ProcessEnv, dependencies?: RuntimeEnvDependencies): NodeJS.ProcessEnv;
 export interface SystemdInstallRequest {
     unitDir: string;
+    lockDir?: string;
     serviceUnit: string;
     timerUnit: string;
     serviceContent: string;
     timerContent: string;
     run: SystemdCommandRunner;
     fileSystem?: SystemdFileSystem;
+    lock?: Partial<SystemdLockOptions>;
 }
 export interface SystemdFileSystem {
     chmod: typeof chmodSync;
     exists: typeof existsSync;
+    lstat: typeof lstatSync;
     mkdir: typeof mkdirSync;
     readFile: typeof readFileSync;
+    readlink: typeof readlinkSync;
     rename: typeof renameSync;
+    rm: typeof rmSync;
     stat: typeof statSync;
+    symlink: typeof symlinkSync;
     unlink: typeof unlinkSync;
     writeFile: typeof writeFileSync;
 }
+interface SystemdLockOptions {
+    timeoutMs: number;
+    staleAfterMs: number;
+    pollMs: number;
+    now: () => number;
+    pid: number;
+    isPidAlive: (pid: number) => boolean;
+    sleep: (milliseconds: number) => void;
+}
 export declare function installSystemdUnits(request: SystemdInstallRequest): void;
+export {};

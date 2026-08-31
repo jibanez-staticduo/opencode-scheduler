@@ -1120,6 +1120,7 @@ function installSystemdJob(job: Job, run: SystemdCommandRunner = defaultSystemdC
   const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1)
   installSystemdUnits({
     unitDir: SYSTEMD_USER_DIR,
+    lockDir: join(SCHEDULER_DIR, "systemd-install-locks"),
     serviceUnit,
     timerUnit,
     serviceContent: createSystemdService(job),
