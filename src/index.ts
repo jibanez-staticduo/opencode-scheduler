@@ -20,7 +20,7 @@ import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
 import { cronToSystemdCalendars, parseCronField, splitCronExpression, validateCronExpression } from "./cron"
 import { installSystemdUnits, type SystemdCommandRunner, withSystemdRuntimeEnv } from "./systemd"
-import { installSystemdWithCronFallback } from "./backend"
+import { installLinuxScheduler } from "./backend"
 
 // Storage location - shared with other opencode tools
 const OPENCODE_CONFIG = join(homedir(), ".config", "opencode")
@@ -1373,16 +1373,15 @@ function installJob(job: Job): SchedulerBackend {
   const backend = resolveSchedulerBackend()
   if (backend === "launchd") {
     installLaunchdJob(job)
-  } else if (backend === "systemd") {
-    return installSystemdWithCronFallback({
+  } else if (backend === "systemd" || backend === "cron") {
+    return installLinuxScheduler({
+      systemdAvailable: backend === "systemd",
       installSystemd: () => installSystemdJob(job),
       isCronAvailable,
       installCron: () => installCronJob(job),
     })
   } else if (backend === "schtasks") {
     installWindowsJob(job)
-  } else {
-    installCronJob(job)
   }
   return backend
 }

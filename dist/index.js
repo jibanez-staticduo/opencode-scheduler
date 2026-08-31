@@ -12447,6 +12447,26 @@ import {
   writeFileSync
 } from "fs";
 import { join } from "path";
+
+class SystemdNonFallbackError extends Error {
+  fallbackSafe = false;
+  originalError;
+  constructor(message, originalError) {
+    super(message);
+    this.name = "SystemdNonFallbackError";
+    this.originalError = originalError;
+  }
+}
+
+class SystemdFallbackSafeError extends Error {
+  fallbackSafe = true;
+  originalError;
+  constructor(message, originalError) {
+    super(message);
+    this.name = "SystemdFallbackSafeError";
+    this.originalError = originalError;
+  }
+}
 var defaultRuntimeEnvDependencies = {
   exists: existsSync,
   uid: () => process.getuid?.()
@@ -12633,6 +12653,14 @@ function bestEffort(action) {
     action();
   } catch {}
 }
+function attempt(action) {
+  try {
+    action();
+    return true;
+  } catch {
+    return false;
+  }
+}
 function restoreUnitFileState(run, timerUnit, state) {
   if (state === "enabled")
     run(`systemctl --user enable ${timerUnit}`, { stdio: "ignore" });
@@ -12715,7 +12743,13 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
 }
 function installSystemdUnits(request) {
   const fileSystem = request.fileSystem ?? defaultFileSystem;
-  const releaseLock = acquireLock(request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"), request.timerUnit, fileSystem, request.lock);
+  let releaseLock;
+  try {
+    releaseLock = acquireLock(request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"), request.timerUnit, fileSystem, request.lock);
+  } catch (error45) {
+    const detail = error45 instanceof Error ? error45.message : String(error45);
+    throw new SystemdNonFallbackError(`Systemd scheduler is busy or its install lock is unsafe (${detail}); retry after the current operation finishes. Cron fallback was not installed.`, error45);
+  }
   let primaryError;
   try {
     fileSystem.mkdir(request.unitDir, { recursive: true });
@@ -12734,17 +12768,23 @@ function installSystemdUnits(request) {
       enabledByAttempt = true;
       request.run(`systemctl --user start ${request.timerUnit}`);
     } catch (error45) {
+      let rollbackComplete = true;
       if (!wasActive)
-        bestEffort(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" }));
+        rollbackComplete = attempt(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
       if (enabledByAttempt)
-        bestEffort(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" }));
-      bestEffort(() => restoreFile(serviceSnapshot, fileSystem));
-      bestEffort(() => restoreFile(timerSnapshot, fileSystem));
-      bestEffort(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" }));
-      bestEffort(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState));
+        rollbackComplete = attempt(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
+      rollbackComplete = attempt(() => restoreFile(serviceSnapshot, fileSystem)) && rollbackComplete;
+      rollbackComplete = attempt(() => restoreFile(timerSnapshot, fileSystem)) && rollbackComplete;
+      rollbackComplete = attempt(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" })) && rollbackComplete;
+      rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState)) && rollbackComplete;
       if (wasActive)
-        bestEffort(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" }));
-      throw error45;
+        rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
+      const cleanPriorState = serviceSnapshot.type === "missing" && timerSnapshot.type === "missing" && !wasActive && (unitFileState === "disabled" || unitFileState === "not-found");
+      const detail = error45 instanceof Error ? error45.message : String(error45);
+      if (cleanPriorState && rollbackComplete) {
+        throw new SystemdFallbackSafeError(`Systemd install failed and was fully rolled back (${detail})`, error45);
+      }
+      throw new SystemdNonFallbackError(`Systemd install failed, but cron fallback is unsafe because a prior or incompletely rolled-back schedule may exist (${detail})`, error45);
     }
   } catch (error45) {
     primaryError = error45;
@@ -12768,11 +12808,23 @@ function installSystemdWithCronFallback(dependencies) {
     dependencies.installSystemd();
     return "systemd";
   } catch (error45) {
+    if (!(error45 instanceof SystemdFallbackSafeError))
+      throw error45;
     if (!dependencies.isCronAvailable())
       throw error45;
     dependencies.installCron();
     return "cron";
   }
+}
+function installLinuxScheduler(dependencies) {
+  if (!dependencies.systemdAvailable) {
+    if (!dependencies.isCronAvailable()) {
+      throw new Error("No supported Linux scheduler backend is available");
+    }
+    dependencies.installCron();
+    return "cron";
+  }
+  return installSystemdWithCronFallback(dependencies);
 }
 
 // src/index.ts
@@ -13849,16 +13901,15 @@ function installJob(job) {
   const backend = resolveSchedulerBackend();
   if (backend === "launchd") {
     installLaunchdJob(job);
-  } else if (backend === "systemd") {
-    return installSystemdWithCronFallback({
+  } else if (backend === "systemd" || backend === "cron") {
+    return installLinuxScheduler({
+      systemdAvailable: backend === "systemd",
       installSystemd: () => installSystemdJob(job),
       isCronAvailable,
       installCron: () => installCronJob(job)
     });
   } else if (backend === "schtasks") {
     installWindowsJob(job);
-  } else {
-    installCronJob(job);
   }
   return backend;
 }

@@ -17,6 +17,28 @@ import type { ExecSyncOptions } from "child_process"
 
 export type SystemdCommandRunner = (command: string, options?: ExecSyncOptions) => Buffer | string
 
+export class SystemdNonFallbackError extends Error {
+  readonly fallbackSafe = false
+  readonly originalError: unknown
+
+  constructor(message: string, originalError?: unknown) {
+    super(message)
+    this.name = "SystemdNonFallbackError"
+    this.originalError = originalError
+  }
+}
+
+export class SystemdFallbackSafeError extends Error {
+  readonly fallbackSafe = true
+  readonly originalError: unknown
+
+  constructor(message: string, originalError?: unknown) {
+    super(message)
+    this.name = "SystemdFallbackSafeError"
+    this.originalError = originalError
+  }
+}
+
 export interface RuntimeEnvDependencies {
   exists: (path: string) => boolean
   uid: () => number | undefined
@@ -257,6 +279,15 @@ function bestEffort(action: () => void): void {
   } catch {}
 }
 
+function attempt(action: () => void): boolean {
+  try {
+    action()
+    return true
+  } catch {
+    return false
+  }
+}
+
 function restoreUnitFileState(run: SystemdCommandRunner, timerUnit: string, state: UnitFileState): void {
   if (state === "enabled") run(`systemctl --user enable ${timerUnit}`, { stdio: "ignore" })
   if (state === "enabled-runtime") run(`systemctl --user enable --runtime ${timerUnit}`, { stdio: "ignore" })
@@ -344,12 +375,21 @@ function acquireLock(
 
 export function installSystemdUnits(request: SystemdInstallRequest): void {
   const fileSystem = request.fileSystem ?? defaultFileSystem
-  const releaseLock = acquireLock(
-    request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"),
-    request.timerUnit,
-    fileSystem,
-    request.lock
-  )
+  let releaseLock: () => void
+  try {
+    releaseLock = acquireLock(
+      request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"),
+      request.timerUnit,
+      fileSystem,
+      request.lock
+    )
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new SystemdNonFallbackError(
+      `Systemd scheduler is busy or its install lock is unsafe (${detail}); retry after the current operation finishes. Cron fallback was not installed.`,
+      error
+    )
+  }
   let primaryError: unknown
   try {
     fileSystem.mkdir(request.unitDir, { recursive: true })
@@ -369,14 +409,28 @@ export function installSystemdUnits(request: SystemdInstallRequest): void {
       enabledByAttempt = true
       request.run(`systemctl --user start ${request.timerUnit}`)
     } catch (error) {
-      if (!wasActive) bestEffort(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" }))
-      if (enabledByAttempt) bestEffort(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" }))
-      bestEffort(() => restoreFile(serviceSnapshot, fileSystem))
-      bestEffort(() => restoreFile(timerSnapshot, fileSystem))
-      bestEffort(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" }))
-      bestEffort(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState))
-      if (wasActive) bestEffort(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" }))
-      throw error
+      let rollbackComplete = true
+      if (!wasActive) rollbackComplete = attempt(() => request.run(`systemctl --user stop ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
+      if (enabledByAttempt) rollbackComplete = attempt(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
+      rollbackComplete = attempt(() => restoreFile(serviceSnapshot, fileSystem)) && rollbackComplete
+      rollbackComplete = attempt(() => restoreFile(timerSnapshot, fileSystem)) && rollbackComplete
+      rollbackComplete = attempt(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" })) && rollbackComplete
+      rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState)) && rollbackComplete
+      if (wasActive) rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete
+
+      const cleanPriorState =
+        serviceSnapshot.type === "missing" &&
+        timerSnapshot.type === "missing" &&
+        !wasActive &&
+        (unitFileState === "disabled" || unitFileState === "not-found")
+      const detail = error instanceof Error ? error.message : String(error)
+      if (cleanPriorState && rollbackComplete) {
+        throw new SystemdFallbackSafeError(`Systemd install failed and was fully rolled back (${detail})`, error)
+      }
+      throw new SystemdNonFallbackError(
+        `Systemd install failed, but cron fallback is unsafe because a prior or incompletely rolled-back schedule may exist (${detail})`,
+        error
+      )
     }
   } catch (error) {
     primaryError = error
