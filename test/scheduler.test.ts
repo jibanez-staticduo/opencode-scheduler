@@ -222,14 +222,108 @@ describe("installSystemdUnits transaction", () => {
     })
   }
 
-  test("never references or mutates an unscoped legacy unit", () => {
+  test("migrates enabled active legacy timer without removing legacy files", () => {
     const root = sandbox()
-    const legacy = join(root, "opencode-job-legacy.timer")
-    writeFileSync(legacy, "legacy")
+    const legacyService = join(root, "legacy.service")
+    const legacyTimer = join(root, "legacy.timer")
+    writeFileSync(legacyService, "legacy service")
+    writeFileSync(legacyTimer, "legacy timer")
+    const states = new Map<string, { enabled: string; active: boolean }>([
+      ["job.timer", { enabled: "disabled", active: false }],
+      ["legacy.timer", { enabled: "enabled", active: true }],
+    ])
+    const calls: string[] = []
+    const run: SystemdCommandRunner = (command) => {
+      calls.push(command)
+      const unit = command.split(" ").at(-1)!
+      const state = states.get(unit)
+      if (command.includes("is-enabled")) return Buffer.from(`${state?.enabled ?? "not-found"}\n`)
+      if (command.includes("is-active")) return Buffer.from(state?.active ? "active\n" : "inactive\n")
+      if (state && command.includes(" disable ")) state.enabled = "disabled"
+      if (state && command.includes(" enable ")) state.enabled = "enabled"
+      if (state && command.includes(" stop ")) state.active = false
+      if (state && command.includes(" start ")) state.active = true
+      return Buffer.alloc(0)
+    }
+    installSystemdUnits({
+      unitDir: root, serviceUnit: "job.service", timerUnit: "job.timer",
+      legacyServiceUnit: "legacy.service", legacyTimerUnit: "legacy.timer", lockKey: "shared-slug",
+      serviceContent: "new service", timerContent: "new timer", run,
+    })
+    expect(states.get("legacy.timer")).toEqual({ enabled: "disabled", active: false })
+    expect(states.get("job.timer")).toEqual({ enabled: "enabled", active: true })
+    expect(readFileSync(legacyService, "utf8")).toBe("legacy service")
+    expect(readFileSync(legacyTimer, "utf8")).toBe("legacy timer")
+    expect(calls.filter((call) => call.includes("legacy.timer") && call.includes(" stop "))).toHaveLength(1)
+  })
+
+  for (const failure of ["first-write", "second-write", "second-chmod", "daemon-reload", "enable", "start"] as FailurePoint[]) {
+    test(`legacy migration restores exact files, links, and state after ${failure}`, () => {
+      const root = sandbox()
+      symlinkSync("/dev/null", join(root, "legacy.service"))
+      symlinkSync("../old/legacy.timer", join(root, "legacy.timer"))
+      const states = new Map<string, { enabled: string; active: boolean }>([
+        ["job.timer", { enabled: "disabled", active: false }],
+        ["legacy.timer", { enabled: "enabled", active: true }],
+      ])
+      const calls: string[] = []
+      let unitWrites = 0
+      let unitChmods = 0
+      const fileSystem: SystemdFileSystem = {
+        chmod: (path, mode) => {
+          if (String(path).includes("job.") && !String(path).includes("owner.json")) {
+            unitChmods += 1
+            if (failure === "second-chmod" && unitChmods === 2) throw new Error(failure)
+          }
+          chmodSync(path, mode)
+        },
+        exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync, readlink: readlinkSync,
+        rename: renameSync, rm: rmSync, stat: statSync, symlink: symlinkSync, unlink: unlinkSync,
+        writeFile: (path, data, options) => {
+          if (String(path).includes("job.") && !String(path).includes("owner.json")) {
+            unitWrites += 1
+            if ((failure === "first-write" && unitWrites === 1) || (failure === "second-write" && unitWrites === 2)) throw new Error(failure)
+          }
+          writeFileSync(path, data, options)
+        },
+      }
+      const run: SystemdCommandRunner = (command) => {
+        calls.push(command)
+        const unit = command.split(" ").at(-1)!
+        const state = states.get(unit)
+        if (command.includes("is-enabled")) return Buffer.from(`${state?.enabled ?? "not-found"}\n`)
+        if (command.includes("is-active")) return Buffer.from(state?.active ? "active\n" : "inactive\n")
+        if (failure === "daemon-reload" && command.endsWith("daemon-reload") && calls.filter((call) => call.endsWith("daemon-reload")).length === 1) throw new Error(failure)
+        if (failure === "enable" && unit === "job.timer" && command.includes(" enable ")) throw new Error(failure)
+        if (failure === "start" && unit === "job.timer" && command.includes(" start ") && calls.filter((call) => call.includes(" start job.timer")).length === 1) throw new Error(failure)
+        if (state && command.includes(" disable ")) state.enabled = "disabled"
+        if (state && command.includes(" enable ")) state.enabled = "enabled"
+        if (state && command.includes(" stop ")) state.active = false
+        if (state && command.includes(" start ")) state.active = true
+        return Buffer.alloc(0)
+      }
+      expect(() => installSystemdUnits({
+        unitDir: root, serviceUnit: "job.service", timerUnit: "job.timer",
+        legacyServiceUnit: "legacy.service", legacyTimerUnit: "legacy.timer", lockKey: "shared-slug",
+        serviceContent: "new", timerContent: "new", run, fileSystem,
+      })).toThrow(SystemdNonFallbackError)
+      expect(states.get("legacy.timer")).toEqual({ enabled: "enabled", active: true })
+      expect(readlinkSync(join(root, "legacy.service"))).toBe("/dev/null")
+      expect(readlinkSync(join(root, "legacy.timer"))).toBe("../old/legacy.timer")
+      expect(existsSync(join(root, "job.service"))).toBe(false)
+      expect(existsSync(join(root, "job.timer"))).toBe(false)
+    })
+  }
+
+  test("no legacy files skips legacy state queries and remains a clean install", () => {
+    const root = sandbox()
     const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
-    install(root, state)
-    expect(readFileSync(legacy, "utf8")).toBe("legacy")
-    expect(state.calls.some((call) => call.includes("legacy"))).toBe(false)
+    installSystemdUnits({
+      unitDir: root, serviceUnit: "job.service", timerUnit: "job.timer",
+      legacyServiceUnit: "legacy.service", legacyTimerUnit: "legacy.timer", lockKey: "shared-slug",
+      serviceContent: "new", timerContent: "new", run: fakeRunner(state),
+    })
+    expect(state.calls.some((call) => call.includes("legacy.timer"))).toBe(false)
   })
 
   for (const target of ["/dev/null", "../units/original.timer"] as const) {
@@ -405,6 +499,37 @@ describe("installSystemdUnits transaction", () => {
     expect(warnings[0].error).toBeInstanceOf(Error)
   })
 
+  test("completed orphan with same live PID is reclaimed by the next operation", () => {
+    const root = sandbox()
+    const lockRoot = join(root, "locks")
+    let failRelease = true
+    const fileSystem: SystemdFileSystem = {
+      chmod: chmodSync, exists: existsSync, lstat: lstatSync, mkdir: mkdirSync, readFile: readFileSync,
+      readlink: readlinkSync, rename: renameSync, rm: (path, options) => {
+        if (failRelease && String(path).endsWith("shared.lock")) throw new Error("LOCK_RELEASE")
+        return rmSync(path, options)
+      }, stat: statSync, symlink: symlinkSync, unlink: unlinkSync, writeFile: writeFileSync,
+    }
+    const first: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    installSystemdUnits({ unitDir: root, lockDir: lockRoot, lockKey: "shared", serviceUnit: "one.service", timerUnit: "one.timer", serviceContent: "one", timerContent: "one", run: fakeRunner(first), fileSystem })
+    expect(existsSync(join(lockRoot, "shared.lock"))).toBe(true)
+    failRelease = false
+    const second: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    installSystemdUnits({ unitDir: root, lockDir: lockRoot, lockKey: "shared", serviceUnit: "two.service", timerUnit: "two.timer", serviceContent: "two", timerContent: "two", run: fakeRunner(second), fileSystem, lock: { timeoutMs: 50, pollMs: 1 } })
+    expect(readFileSync(join(root, "two.timer"), "utf8")).toBe("two")
+    expect(existsSync(join(lockRoot, "shared.lock"))).toBe(false)
+  })
+
+  test("active lock owned by the same live PID is not reclaimed", () => {
+    const root = sandbox()
+    const lockPath = join(root, "locks", "shared.lock")
+    mkdirSync(lockPath, { recursive: true })
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid, timestamp: 0, token: "active-token", phase: "active" }))
+    const state: FakeState = { unitFileState: "disabled", active: false, calls: [] }
+    expect(() => installSystemdUnits({ unitDir: root, lockDir: join(root, "locks"), lockKey: "shared", serviceUnit: "job.service", timerUnit: "job.timer", serviceContent: "new", timerContent: "new", run: fakeRunner(state), lock: { timeoutMs: 5, pollMs: 1, staleAfterMs: 1 } })).toThrow(SystemdNonFallbackError)
+    expect(state.calls).toEqual([])
+  })
+
   test("OWNER_WRITE is not masked by OWNER_CLEANUP", () => {
     const root = sandbox()
     const fileSystem: SystemdFileSystem = {
@@ -412,7 +537,7 @@ describe("installSystemdUnits transaction", () => {
       readlink: readlinkSync, rename: renameSync, rm: () => { throw new Error("OWNER_CLEANUP") },
       stat: statSync, symlink: symlinkSync, unlink: unlinkSync,
       writeFile: (path, data, options) => {
-        if (String(path).endsWith("owner.json")) throw new Error("OWNER_WRITE")
+        if (String(path).includes("owner.json")) throw new Error("OWNER_WRITE")
         writeFileSync(path, data, options)
       },
     }

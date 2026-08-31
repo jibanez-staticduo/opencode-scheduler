@@ -68,7 +68,7 @@ Jobs run from the working directory where you created them, picking up your `ope
 - **No overlap**: if the previous run is still active, the next scheduled tick is skipped.
 - **Non-interactive by default**: scheduled runs force `OPENCODE_PERMISSION` to deny "question" prompts, so jobs don't hang waiting for approvals.
 - **Optional timeout**: set `timeoutSeconds` to hard-stop long runs (SIGTERM, then SIGKILL).
-- **Transactional systemd updates**: Linux installation preserves regular files or exact symlink targets (including masked units), permissions, unit-file state, and active state on failure. A bounded cross-process lock serializes updates to the same scoped timer; live locks are never broken and dead stale locks are reclaimed.
+- **Transactional systemd updates**: Linux installation preserves regular files or exact symlink targets (including masked units), permissions, unit-file state, and active state on failure. Legacy unscoped timers are stopped and disabled under the same slug lock, preventing migration duplicates while retaining their files. Completed lock orphans are reclaimable by operation token; genuinely active live locks are never broken.
 
 ### Platform Support
 

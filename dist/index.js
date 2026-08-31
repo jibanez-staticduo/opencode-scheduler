@@ -12502,6 +12502,7 @@ var defaultFileSystem = {
   unlink: unlinkSync,
   writeFile: writeFileSync
 };
+var localCompletedLocks = new Map;
 var sleepArray = new Int32Array(new SharedArrayBuffer(4));
 var defaultLockOptions = {
   timeoutMs: 1e4,
@@ -12680,27 +12681,47 @@ function readLockMetadata(lockPath, fileSystem) {
     const record2 = parsed;
     return {
       pid: typeof record2.pid === "number" ? record2.pid : undefined,
-      timestamp: typeof record2.timestamp === "number" ? record2.timestamp : undefined
+      timestamp: typeof record2.timestamp === "number" ? record2.timestamp : undefined,
+      token: typeof record2.token === "string" ? record2.token : undefined,
+      phase: record2.phase === "active" || record2.phase === "completed" ? record2.phase : undefined
     };
   } catch {
     return {};
   }
 }
+function writeLockMetadata(lockPath, metadata, fileSystem) {
+  atomicReplace(join(lockPath, "owner.json"), JSON.stringify(metadata), 384, fileSystem);
+}
 function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
   const options = { ...defaultLockOptions, ...overrides };
   fileSystem.mkdir(lockRoot, { recursive: true });
   const lockPath = join(lockRoot, `${timerUnit}.lock`);
+  const token = `${options.pid}-${options.now()}-${temporaryFileSequence += 1}`;
   const startedAt = options.now();
   while (true) {
     try {
       fileSystem.mkdir(lockPath);
       try {
-        fileSystem.writeFile(join(lockPath, "owner.json"), JSON.stringify({ pid: options.pid, timestamp: options.now() }));
+        writeLockMetadata(lockPath, { pid: options.pid, timestamp: options.now(), token, phase: "active" }, fileSystem);
       } catch (error45) {
         bestEffort(() => fileSystem.rm(lockPath, { recursive: true, force: true }));
         throw error45;
       }
-      return () => fileSystem.rm(lockPath, { recursive: true, force: true });
+      return {
+        release() {
+          localCompletedLocks.set(lockPath, token);
+          try {
+            writeLockMetadata(lockPath, { pid: options.pid, timestamp: options.now(), token, phase: "completed" }, fileSystem);
+          } finally {
+            try {
+              fileSystem.rm(lockPath, { recursive: true, force: true });
+              localCompletedLocks.delete(lockPath);
+            } catch (error45) {
+              throw error45;
+            }
+          }
+        }
+      };
     } catch (error45) {
       if (!isErrorCode(error45, "EEXIST"))
         throw error45;
@@ -12722,7 +12743,8 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
       const timestamp = metadata.timestamp ?? lockStats.mtimeMs;
       const oldEnough = options.now() - timestamp >= options.staleAfterMs;
       const ownerAlive = metadata.pid !== undefined && options.isPidAlive(metadata.pid);
-      if (oldEnough && !ownerAlive) {
+      const locallyCompleted = metadata.token !== undefined && localCompletedLocks.get(lockPath) === metadata.token;
+      if (metadata.phase === "completed" || locallyCompleted || oldEnough && !ownerAlive) {
         const quarantinePath = join(lockRoot, `${timerUnit}.stale-${options.pid}-${options.now()}-${temporaryFileSequence += 1}`);
         try {
           fileSystem.rename(lockPath, quarantinePath);
@@ -12732,6 +12754,8 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
           throw claimError;
         }
         fileSystem.rm(quarantinePath, { recursive: true, force: true });
+        if (metadata.token)
+          localCompletedLocks.delete(lockPath);
         continue;
       }
       if (options.now() - startedAt >= options.timeoutMs) {
@@ -12743,9 +12767,9 @@ function acquireLock(lockRoot, timerUnit, fileSystem, overrides) {
 }
 function installSystemdUnits(request) {
   const fileSystem = request.fileSystem ?? defaultFileSystem;
-  let releaseLock;
+  let lockHandle;
   try {
-    releaseLock = acquireLock(request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"), request.timerUnit, fileSystem, request.lock);
+    lockHandle = acquireLock(request.lockDir ?? join(request.unitDir, ".opencode-scheduler-locks"), request.lockKey ?? request.timerUnit, fileSystem, request.lock);
   } catch (error45) {
     const detail = error45 instanceof Error ? error45.message : String(error45);
     throw new SystemdNonFallbackError(`Systemd scheduler is busy or its install lock is unsafe (${detail}); retry after the current operation finishes. Cron fallback was not installed.`, error45);
@@ -12759,8 +12783,19 @@ function installSystemdUnits(request) {
     const timerSnapshot = snapshotFile(timerPath, fileSystem);
     const unitFileState = queryUnitFileState(request.run, request.timerUnit);
     const wasActive = queryActiveState(request.run, request.timerUnit);
+    const legacyServicePath = request.legacyServiceUnit ? join(request.unitDir, request.legacyServiceUnit) : undefined;
+    const legacyTimerPath = request.legacyTimerUnit ? join(request.unitDir, request.legacyTimerUnit) : undefined;
+    const legacyServiceSnapshot = legacyServicePath ? snapshotFile(legacyServicePath, fileSystem) : undefined;
+    const legacyTimerSnapshot = legacyTimerPath ? snapshotFile(legacyTimerPath, fileSystem) : undefined;
+    const legacyRelevant = Boolean(request.legacyTimerUnit && (legacyServiceSnapshot?.type !== "missing" || legacyTimerSnapshot?.type !== "missing"));
+    const legacyUnitFileState = legacyRelevant ? queryUnitFileState(request.run, request.legacyTimerUnit) : undefined;
+    const legacyWasActive = legacyRelevant ? queryActiveState(request.run, request.legacyTimerUnit) : false;
     let enabledByAttempt = false;
     try {
+      if (legacyRelevant) {
+        request.run(`systemctl --user stop ${request.legacyTimerUnit}`);
+        request.run(`systemctl --user disable ${request.legacyTimerUnit}`);
+      }
       atomicReplace(servicePath, request.serviceContent, 420, fileSystem);
       atomicReplace(timerPath, request.timerContent, 420, fileSystem);
       request.run("systemctl --user daemon-reload");
@@ -12775,11 +12810,19 @@ function installSystemdUnits(request) {
         rollbackComplete = attempt(() => request.run(`systemctl --user disable ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
       rollbackComplete = attempt(() => restoreFile(serviceSnapshot, fileSystem)) && rollbackComplete;
       rollbackComplete = attempt(() => restoreFile(timerSnapshot, fileSystem)) && rollbackComplete;
+      if (legacyServiceSnapshot)
+        rollbackComplete = attempt(() => restoreFile(legacyServiceSnapshot, fileSystem)) && rollbackComplete;
+      if (legacyTimerSnapshot)
+        rollbackComplete = attempt(() => restoreFile(legacyTimerSnapshot, fileSystem)) && rollbackComplete;
       rollbackComplete = attempt(() => request.run("systemctl --user daemon-reload", { stdio: "ignore" })) && rollbackComplete;
       rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.timerUnit, unitFileState)) && rollbackComplete;
       if (wasActive)
         rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.timerUnit}`, { stdio: "ignore" })) && rollbackComplete;
-      const cleanPriorState = serviceSnapshot.type === "missing" && timerSnapshot.type === "missing" && !wasActive && (unitFileState === "disabled" || unitFileState === "not-found");
+      if (legacyUnitFileState)
+        rollbackComplete = attempt(() => restoreUnitFileState(request.run, request.legacyTimerUnit, legacyUnitFileState)) && rollbackComplete;
+      if (legacyWasActive)
+        rollbackComplete = attempt(() => request.run(`systemctl --user start ${request.legacyTimerUnit}`, { stdio: "ignore" })) && rollbackComplete;
+      const cleanPriorState = serviceSnapshot.type === "missing" && timerSnapshot.type === "missing" && !wasActive && !legacyRelevant && (unitFileState === "disabled" || unitFileState === "not-found");
       const detail = error45 instanceof Error ? error45.message : String(error45);
       if (cleanPriorState && rollbackComplete) {
         throw new SystemdFallbackSafeError(`Systemd install failed and was fully rolled back (${detail})`, error45);
@@ -12791,10 +12834,10 @@ function installSystemdUnits(request) {
     throw error45;
   } finally {
     if (primaryError)
-      bestEffort(releaseLock);
+      bestEffort(lockHandle.release);
     else {
       try {
-        releaseLock();
+        lockHandle.release();
       } catch (error45) {
         request.onWarning?.(`Systemd schedule ${request.timerUnit} is installed, but its install lock could not be removed; cron fallback was not installed.`, error45);
       }
@@ -13682,11 +13725,16 @@ function installSystemdJob(job, run = defaultSystemdCommandRunner) {
   const timerPath = join2(SYSTEMD_USER_DIR, `opencode-job-${scopeId}-${job.slug}.timer`);
   const serviceUnit = servicePath.slice(SYSTEMD_USER_DIR.length + 1);
   const timerUnit = timerPath.slice(SYSTEMD_USER_DIR.length + 1);
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(job.slug))
+    throw new Error(`Invalid job slug for systemd unit: ${job.slug}`);
   installSystemdUnits({
     unitDir: SYSTEMD_USER_DIR,
     lockDir: join2(SCHEDULER_DIR, "systemd-install-locks"),
     serviceUnit,
     timerUnit,
+    lockKey: `opencode-job-${job.slug}`,
+    legacyServiceUnit: `opencode-job-${job.slug}.service`,
+    legacyTimerUnit: `opencode-job-${job.slug}.timer`,
     serviceContent: createSystemdService(job),
     timerContent: createSystemdTimer(job),
     run,

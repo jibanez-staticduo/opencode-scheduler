@@ -23,6 +23,9 @@ export interface SystemdInstallRequest {
     timerUnit: string;
     serviceContent: string;
     timerContent: string;
+    lockKey?: string;
+    legacyServiceUnit?: string;
+    legacyTimerUnit?: string;
     run: SystemdCommandRunner;
     fileSystem?: SystemdFileSystem;
     lock?: Partial<SystemdLockOptions>;
